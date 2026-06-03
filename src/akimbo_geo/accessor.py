@@ -7,7 +7,7 @@ Usage
     import akimbo.pandas   # register .ak
     import akimbo_geo      # register .ak.geo
 
-    # series contains list<list<float>> Polygon geometries
+    # series contains list<list<float>> Polygon geometries (any coord format)
     series.ak.geo.area()
     series.ak.geo.length()
     series.ak.geo.bounds()
@@ -21,6 +21,19 @@ Each public method is a staticmethod built with ``akimbo.apply_tree.dec``,
 which handles the full nested tree walk so that operations work at any depth
 of nesting (list-of-geometries, list-of-list-of-geometries, mixed records,
 etc.).
+
+Coordinate representations
+---------------------------
+All three GeoArrow coordinate representations are accepted and automatically
+normalised to interleaved flat float64 before the numba kernels run:
+
+- Interleaved flat (spatialpandas): ``list<float>``
+- Interleaved FixedSizeList (GeoArrow native): ``list<FixedSizeList[n]<float>>``
+- Separated struct (GeoArrow recommended): ``list<Struct<x:float,y:float,...>>``
+
+Heuristic inference also handles:
+- ``series(list(2 * float))`` — each row is a list of 2-element coord arrays
+- ``series(2 * float)`` — each row is a 2D coordinate pair (Point)
 """
 
 from __future__ import annotations
@@ -33,6 +46,8 @@ from akimbo.mixin import EagerAccessor, LazyAccessor
 
 from akimbo_geo import algorithms as alg
 from akimbo_geo.match import (
+    CoordKind,
+    GeoLayout,
     extract_offsets_and_values,
     match_any_geom,
     match_line,
@@ -42,14 +57,32 @@ from akimbo_geo.match import (
 
 
 # ===========================================================================
-# Op functions — called by dec() with a matched ak layout node
-# Each receives an ak.contents.Content node (inmode="ak") and returns an
-# ak.Array or ak.contents.Content.
+# Offset scaling helper
+# ===========================================================================
+
+def _scale_offsets(offsets, geo: GeoLayout):
+    """Scale point-indexed offsets to float-indexed offsets for the kernels.
+
+    The numba kernels from spatialpandas expect offsets that index directly
+    into the flat float buffer.  For INTERLEAVED_FLAT the Arrow offsets
+    already do this (one offset unit = one float).  For FSL and STRUCT, the
+    Arrow list offsets count *coordinate points*, so we multiply by n_dims.
+    """
+    if geo.coord_kind == CoordKind.INTERLEAVED_FLAT:
+        return offsets   # already in float units
+    # FSL or STRUCT: offsets are in point units, scale to float units
+    return tuple(o * geo.n_dims for o in offsets)
+
+
+# ===========================================================================
+# Op functions — called by dec() with a matched ak layout node (inmode="ak")
+# Each receives an ak.contents.Content node and returns an ak.Array.layout.
 # ===========================================================================
 
 def _op_length(layout):
-    """Length for list<float> (Line / Ring / MultiPoint)."""
-    values, (off0,) = extract_offsets_and_values(layout)
+    """Length for depth-1 geometries (Line / Ring / MultiPoint)."""
+    values, offsets, geo = extract_offsets_and_values(layout)
+    off0, = _scale_offsets(offsets, geo)
     n = len(off0) - 1
     result = np.full(n, np.nan, dtype=np.float64)
     missing = np.zeros(n, dtype=np.bool_)
@@ -58,8 +91,9 @@ def _op_length(layout):
 
 
 def _op_length2(layout):
-    """Length for list<list<float>> (MultiLine / Polygon perimeter)."""
-    values, (off0, off1) = extract_offsets_and_values(layout)
+    """Length for depth-2 geometries (MultiLine / Polygon perimeter)."""
+    values, offsets, geo = extract_offsets_and_values(layout)
+    off0, off1 = _scale_offsets(offsets, geo)
     n = len(off0) - 1
     result = np.full(n, np.nan, dtype=np.float64)
     missing = np.zeros(n, dtype=np.bool_)
@@ -68,8 +102,9 @@ def _op_length2(layout):
 
 
 def _op_length3(layout):
-    """Length for list<list<list<float>>> (MultiPolygon perimeter)."""
-    values, (off0, off1, off2) = extract_offsets_and_values(layout)
+    """Length for depth-3 geometries (MultiPolygon perimeter)."""
+    values, offsets, geo = extract_offsets_and_values(layout)
+    off0, off1, off2 = _scale_offsets(offsets, geo)
     n = len(off0) - 1
     result = np.full(n, np.nan, dtype=np.float64)
     missing = np.zeros(n, dtype=np.bool_)
@@ -78,8 +113,9 @@ def _op_length3(layout):
 
 
 def _op_area(layout):
-    """Area for list<list<float>> (Polygon)."""
-    values, (off0, off1) = extract_offsets_and_values(layout)
+    """Area for depth-2 geometries (Polygon / MultiLine)."""
+    values, offsets, geo = extract_offsets_and_values(layout)
+    off0, off1 = _scale_offsets(offsets, geo)
     n = len(off0) - 1
     result = np.full(n, np.nan, dtype=np.float64)
     missing = np.zeros(n, dtype=np.bool_)
@@ -88,8 +124,9 @@ def _op_area(layout):
 
 
 def _op_area3(layout):
-    """Area for list<list<list<float>>> (MultiPolygon)."""
-    values, (off0, off1, off2) = extract_offsets_and_values(layout)
+    """Area for depth-3 geometries (MultiPolygon)."""
+    values, offsets, geo = extract_offsets_and_values(layout)
+    off0, off1, off2 = _scale_offsets(offsets, geo)
     n = len(off0) - 1
     result = np.full(n, np.nan, dtype=np.float64)
     missing = np.zeros(n, dtype=np.bool_)
@@ -99,16 +136,17 @@ def _op_area3(layout):
 
 def _op_bounds(layout):
     """Bounding box for any geometry — returns record{xmin,ymin,xmax,ymax}."""
-    values, offsets = extract_offsets_and_values(layout)
-    n = len(offsets[0]) - 1
+    values, offsets, geo = extract_offsets_and_values(layout)
+    scaled = _scale_offsets(offsets, geo)
+    n = len(scaled[0]) - 1
     result = np.full((n, 4), np.nan, dtype=np.float64)
     missing = np.zeros(n, dtype=np.bool_)
-    if len(offsets) == 1:
-        alg.bounds_map1(values, offsets[0], result, missing)
-    elif len(offsets) == 2:
-        alg.bounds_map2(values, offsets[0], offsets[1], result, missing)
+    if len(scaled) == 1:
+        alg.bounds_map1(values, scaled[0], result, missing)
+    elif len(scaled) == 2:
+        alg.bounds_map2(values, scaled[0], scaled[1], result, missing)
     else:
-        alg.bounds_map3(values, offsets[0], offsets[1], offsets[2], result, missing)
+        alg.bounds_map3(values, scaled[0], scaled[1], scaled[2], result, missing)
     return ak.Array(
         {"xmin": result[:, 0], "ymin": result[:, 1],
          "xmax": result[:, 2], "ymax": result[:, 3]}
@@ -116,8 +154,9 @@ def _op_bounds(layout):
 
 
 def _op_centroid1(layout):
-    """Centroid (mean of coords) for list<float> geometries."""
-    values, (off0,) = extract_offsets_and_values(layout)
+    """Centroid (mean of coords) for depth-1 geometries."""
+    values, offsets, geo = extract_offsets_and_values(layout)
+    off0, = _scale_offsets(offsets, geo)
     n = len(off0) - 1
     result_x = np.full(n, np.nan, dtype=np.float64)
     result_y = np.full(n, np.nan, dtype=np.float64)
@@ -127,8 +166,9 @@ def _op_centroid1(layout):
 
 
 def _op_centroid2(layout):
-    """Area-weighted centroid for list<list<float>> polygon geometries."""
-    values, (off0, off1) = extract_offsets_and_values(layout)
+    """Area-weighted centroid for depth-2 polygon geometries."""
+    values, offsets, geo = extract_offsets_and_values(layout)
+    off0, off1 = _scale_offsets(offsets, geo)
     n = len(off0) - 1
     result_x = np.full(n, np.nan, dtype=np.float64)
     result_y = np.full(n, np.nan, dtype=np.float64)
@@ -138,8 +178,9 @@ def _op_centroid2(layout):
 
 
 def _op_intersects_bounds(layout, x0, y0, x1, y1):
-    """Boolean: does each list<float> geometry intersect bounding box?"""
-    values, (off0,) = extract_offsets_and_values(layout)
+    """Boolean: does each depth-1 geometry intersect bounding box?"""
+    values, offsets, geo = extract_offsets_and_values(layout)
+    off0, = _scale_offsets(offsets, geo)
     n = len(off0) - 1
     result = np.zeros(n, dtype=np.bool_)
     missing = np.zeros(n, dtype=np.bool_)
@@ -156,9 +197,13 @@ def _op_intersects_bounds(layout, x0, y0, x1, y1):
 
 _METHODS = [
     "area",
+    "area3",
     "length",
+    "length2",
+    "length3",
     "bounds",
     "centroid",
+    "centroid_polygon",
     "intersects_bounds",
     "from_wkb",
     "to_wkb",
@@ -171,45 +216,40 @@ _METHODS = [
 class GeoAccessor:
     """Geometry operations on nested / var-length coordinate columns.
 
-    The canonical storage format is **interleaved flat float lists**,
-    matching the spatialpandas Arrow representation:
+    Accepts any of the three GeoArrow coordinate representations plus the
+    spatialpandas interleaved-flat convention, and two heuristic forms:
 
-    - ``list<float>``              — Line, Ring, MultiPoint
-    - ``list<list<float>>``        — Polygon, MultiLine
-    - ``list<list<list<float>>>``  — MultiPolygon
+    Coordinate representations
+    --------------------------
+    - Interleaved flat:  ``list<float>`` — ``[x0,y0,x1,y1,...]``
+    - Interleaved FSL:   ``list<FixedSizeList<float>[n]>`` — geoarrow native
+    - Separated struct:  ``list<Struct<x:float, y:float, ...>>`` — geoarrow recommended
+    - Heuristic:         ``list(2 * float)`` or ``2 * float`` at series level
 
-    All coordinates are interleaved: ``[x0, y0, x1, y1, ...]``.
+    Geometry type is determined by List nesting depth above the coord leaf:
+    0 = Point, 1 = Line/MultiPoint, 2 = Polygon/MultiLine, 3 = MultiPolygon.
 
-    WKB / WKT are supported as import/export formats only; the in-memory
-    representation never boxes coordinates into geometry objects.
+    WKB / WKT are I/O-only formats; in-memory compute never boxes coordinates.
     """
 
     # --- Measurements -------------------------------------------------------
 
-    # Length dispatches over all three nesting levels with separate ops so
-    # that the correct numba kernel is called for each geometry type.
-    length = staticmethod(dec(_op_length,  match=match_line,         inmode="ak"))
-    # For 2/3-level nesting the user calls .length on the inner structures;
-    # provide convenience aliases that match the deeper layouts too.
-    length2 = staticmethod(dec(_op_length2, match=match_polygon,     inmode="ak"))
+    length  = staticmethod(dec(_op_length,  match=match_line,         inmode="ak"))
+    length2 = staticmethod(dec(_op_length2, match=match_polygon,      inmode="ak"))
     length3 = staticmethod(dec(_op_length3, match=match_multipolygon, inmode="ak"))
 
-    # Area only meaningful for polygon types.
-    area  = staticmethod(dec(_op_area,  match=match_polygon,      inmode="ak"))
-    area3 = staticmethod(dec(_op_area3, match=match_multipolygon, inmode="ak"))
+    area    = staticmethod(dec(_op_area,    match=match_polygon,      inmode="ak"))
+    area3   = staticmethod(dec(_op_area3,   match=match_multipolygon, inmode="ak"))
 
-    # Bounds and centroid work across all geometry types.
-    bounds   = staticmethod(dec(_op_bounds,   match=match_any_geom, inmode="ak"))
-    centroid = staticmethod(dec(_op_centroid1, match=match_line,    inmode="ak"))
-    centroid_polygon = staticmethod(
-        dec(_op_centroid2, match=match_polygon, inmode="ak")
-    )
+    bounds          = staticmethod(dec(_op_bounds,   match=match_any_geom, inmode="ak"))
+    centroid        = staticmethod(dec(_op_centroid1, match=match_line,    inmode="ak"))
+    centroid_polygon = staticmethod(dec(_op_centroid2, match=match_polygon, inmode="ak"))
 
     # --- Spatial predicates -------------------------------------------------
 
     @staticmethod
     def intersects_bounds(arr, x0, y0, x1, y1):
-        """Return bool array: does each list<float> geometry intersect the bbox?
+        """Return bool array: does each depth-1 geometry intersect the bbox?
 
         Parameters
         ----------
@@ -227,16 +267,13 @@ class GeoAccessor:
     def total_bounds(arr):
         """Return the aggregate (xmin, ymin, xmax, ymax) over the entire array.
 
-        Parameters
-        ----------
-        arr : ak.Array
-
         Returns
         -------
         tuple[float, float, float, float]
         """
-        # Flatten all coordinate values and call the scalar kernel.
         flat = ak.ravel(arr)
+        # ravel gives the innermost float values; for separated struct this
+        # may include z/m components, but for 2D data it's always x,y pairs.
         values = np.asarray(flat).astype(np.float64)
         return alg.total_bounds(values)
 
@@ -253,7 +290,7 @@ class GeoAccessor:
 
     @staticmethod
     def to_wkb(arr):
-        """Encode interleaved coordinate list-of-floats → WKB bytestrings.
+        """Encode coordinate layout → WKB bytestrings.
 
         Requires ``shapely>=2.0``.
         """
@@ -271,7 +308,7 @@ class GeoAccessor:
 
     @staticmethod
     def to_wkt(arr):
-        """Encode interleaved coordinate list-of-floats → WKT strings.
+        """Encode coordinate layout → WKT strings.
 
         Requires ``shapely>=2.0``.
         """
@@ -283,7 +320,7 @@ class GeoAccessor:
 
 
 # ---------------------------------------------------------------------------
-# Registration — same pattern as akimbo.strings / akimbo.datetimes
+# Registration
 # ---------------------------------------------------------------------------
 EagerAccessor.register_accessor("geo", GeoAccessor)
 LazyAccessor.register_accessor("geo", GeoAccessor)

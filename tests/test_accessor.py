@@ -81,21 +81,58 @@ class TestMatch:
 
 class TestExtract:
     def test_1level(self):
-        from akimbo_geo.match import extract_offsets_and_values
+        from akimbo_geo.match import extract_offsets_and_values, CoordKind
         data = [[0.0, 0.0, 1.0, 0.0], [2.0, 2.0, 3.0, 3.0]]
         arr = ak.from_arrow(pa.array(data, type=pa.list_(pa.float64())))
-        values, offsets = extract_offsets_and_values(arr.layout)
+        values, offsets, geo = extract_offsets_and_values(arr.layout)
         assert len(offsets) == 1
         assert list(offsets[0]) == [0, 4, 8]
         np.testing.assert_allclose(values, [0.0, 0.0, 1.0, 0.0, 2.0, 2.0, 3.0, 3.0])
+        assert geo.coord_kind == CoordKind.INTERLEAVED_FLAT
+        assert geo.list_depth == 1
 
     def test_2level(self):
-        from akimbo_geo.match import extract_offsets_and_values
+        from akimbo_geo.match import extract_offsets_and_values, CoordKind
         data = [[[0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0]]]
         arr = ak.from_arrow(pa.array(data, type=pa.list_(pa.list_(pa.float64()))))
-        values, offsets = extract_offsets_and_values(arr.layout)
+        values, offsets, geo = extract_offsets_and_values(arr.layout)
         assert len(offsets) == 2
         assert len(values) == 8
+        assert geo.coord_kind == CoordKind.INTERLEAVED_FLAT
+        assert geo.list_depth == 2
+
+    def test_fsl_interleaved(self):
+        """GeoArrow FixedSizeList interleaved LineString."""
+        from akimbo_geo.match import extract_offsets_and_values, CoordKind
+        arr = ak.from_arrow(pa.array(
+            [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]], [[2.0, 2.0], [3.0, 4.0]]],
+            type=pa.list_(pa.list_(pa.field("xy", pa.float64()), 2))
+        ))
+        values, offsets, geo = extract_offsets_and_values(arr.layout)
+        assert geo.coord_kind == CoordKind.INTERLEAVED_FSL
+        assert geo.n_dims == 2
+        assert geo.list_depth == 1
+        # offsets are point-indexed (3 pts, 2 pts → [0, 3, 5])
+        assert list(offsets[0]) == [0, 3, 5]
+        # values are the raw interleaved floats
+        np.testing.assert_allclose(
+            values, [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 4.0]
+        )
+
+    def test_separated_struct(self):
+        """GeoArrow separated struct LineString."""
+        from akimbo_geo.match import extract_offsets_and_values, CoordKind
+        coord_type = pa.struct([pa.field("x", pa.float64()), pa.field("y", pa.float64())])
+        arr = ak.from_arrow(pa.array(
+            [[{"x": 0.0, "y": 0.0}, {"x": 3.0, "y": 4.0}]],
+            type=pa.list_(coord_type)
+        ))
+        values, offsets, geo = extract_offsets_and_values(arr.layout)
+        assert geo.coord_kind == CoordKind.SEPARATED_STRUCT
+        assert geo.n_dims == 2
+        assert geo.list_depth == 1
+        # interleaved output: [0, 0, 3, 4]
+        np.testing.assert_allclose(values, [0.0, 0.0, 3.0, 4.0])
 
 
 # ===========================================================================
