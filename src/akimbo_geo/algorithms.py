@@ -38,7 +38,7 @@ ngpjit = jit(nopython=True, nogil=True, parallel=True)
 # Scalar kernels — operate on a single geometry's slice of the flat buffer
 # ===========================================================================
 
-@ngjit
+@ngjit  # pragma: no cover
 def compute_line_length(values, value_offsets):
     """Total Euclidean length of a single line / ring / multiline.
 
@@ -72,7 +72,7 @@ def compute_line_length(values, value_offsets):
     return total
 
 
-@ngjit
+@ngjit  # pragma: no cover
 def compute_area(values, value_offsets):
     """Signed area of a single polygon (exterior + holes) via the shoelace formula.
 
@@ -105,7 +105,7 @@ def compute_area(values, value_offsets):
     return area / 2.0
 
 
-@ngjit
+@ngjit  # pragma: no cover
 def compute_bounds(values, start, stop):
     """Bounding box of a single geometry's flat coordinate slice.
 
@@ -133,7 +133,7 @@ def compute_bounds(values, start, stop):
     return xmin, ymin, xmax, ymax
 
 
-@ngjit
+@ngjit  # pragma: no cover
 def compute_centroid_line(values, start, stop):
     """Centroid of a point set / line as the simple mean of coordinates.
 
@@ -154,7 +154,7 @@ def compute_centroid_line(values, start, stop):
     return cx / n, cy / n
 
 
-@ngjit
+@ngjit  # pragma: no cover
 def compute_centroid_polygon(values, value_offsets):
     """Area-weighted centroid of a polygon (exterior ring only).
 
@@ -203,7 +203,7 @@ def compute_centroid_polygon(values, value_offsets):
 
 # --- 1-level nesting: list<float> (Line / Ring / MultiPoint) ---------------
 
-@ngpjit
+@ngpjit  # pragma: no cover
 def length_map1(values, offsets0, result, missing):
     """Compute length for each list<float> geometry in parallel.
 
@@ -221,7 +221,7 @@ def length_map1(values, offsets0, result, missing):
             result[i] = compute_line_length(values, seg_offsets)
 
 
-@ngpjit
+@ngpjit  # pragma: no cover
 def bounds_map1(values, offsets0, result, missing):
     """Bounding box for each list<float> geometry.
 
@@ -237,7 +237,7 @@ def bounds_map1(values, offsets0, result, missing):
             result[i, 3] = ymax
 
 
-@ngpjit
+@ngpjit  # pragma: no cover
 def centroid_map1(values, offsets0, result_x, result_y, missing):
     """Centroid (mean of coords) for each list<float> geometry."""
     n = len(offsets0) - 1
@@ -250,7 +250,7 @@ def centroid_map1(values, offsets0, result_x, result_y, missing):
 
 # --- 2-level nesting: list<list<float>> (Polygon / MultiLine) ---------------
 
-@ngpjit
+@ngpjit  # pragma: no cover
 def length_map2(values, offsets0, offsets1, result, missing):
     """Compute length for each list<list<float>> geometry in parallel.
 
@@ -264,7 +264,7 @@ def length_map2(values, offsets0, offsets1, result, missing):
             result[i] = compute_line_length(values, inner)
 
 
-@ngpjit
+@ngpjit  # pragma: no cover
 def area_map2(values, offsets0, offsets1, result, missing):
     """Compute area for each list<list<float>> geometry in parallel.
 
@@ -277,7 +277,7 @@ def area_map2(values, offsets0, offsets1, result, missing):
             result[i] = compute_area(values, inner)
 
 
-@ngpjit
+@ngpjit  # pragma: no cover
 def bounds_map2(values, offsets0, offsets1, result, missing):
     """Bounding box for each list<list<float>> geometry.
 
@@ -295,7 +295,7 @@ def bounds_map2(values, offsets0, offsets1, result, missing):
             result[i, 3] = ymax
 
 
-@ngpjit
+@ngpjit  # pragma: no cover
 def centroid_map2(values, offsets0, offsets1, result_x, result_y, missing):
     """Area-weighted centroid for each list<list<float>> polygon geometry."""
     n = len(offsets0) - 1
@@ -309,7 +309,7 @@ def centroid_map2(values, offsets0, offsets1, result_x, result_y, missing):
 
 # --- 3-level nesting: list<list<list<float>>> (MultiPolygon) ----------------
 
-@ngpjit
+@ngpjit  # pragma: no cover
 def length_map3(values, offsets0, offsets1, offsets2, result, missing):
     """Compute length for each list<list<list<float>>> geometry in parallel."""
     n = len(offsets0) - 1
@@ -322,7 +322,7 @@ def length_map3(values, offsets0, offsets1, offsets2, result, missing):
             result[i] = compute_line_length(values, inner2)
 
 
-@ngpjit
+@ngpjit  # pragma: no cover
 def area_map3(values, offsets0, offsets1, offsets2, result, missing):
     """Compute area for each list<list<list<float>>> geometry in parallel."""
     n = len(offsets0) - 1
@@ -335,7 +335,7 @@ def area_map3(values, offsets0, offsets1, offsets2, result, missing):
             result[i] = compute_area(values, inner2)
 
 
-@ngpjit
+@ngpjit  # pragma: no cover
 def bounds_map3(values, offsets0, offsets1, offsets2, result, missing):
     """Bounding box for each list<list<list<float>>> geometry.
 
@@ -358,7 +358,7 @@ def bounds_map3(values, offsets0, offsets1, offsets2, result, missing):
 # Aggregate (whole-column) helpers
 # ===========================================================================
 
-@ngjit
+@ngjit  # pragma: no cover
 def total_bounds(values):
     """Return the aggregate bounding box of all coordinates in values.
 
@@ -390,7 +390,7 @@ def total_bounds(values):
 # Intersection / predicate kernels (ported from spatialpandas)
 # ===========================================================================
 
-@ngjit
+@ngjit  # pragma: no cover
 def _segments_intersect(ax0, ay0, ax1, ay1, bx0, by0, bx1, by1):
     """Return True if line segment A intersects line segment B."""
     def _orient(px, py, qx, qy, rx, ry):
@@ -423,7 +423,7 @@ def _segments_intersect(ax0, ay0, ax1, ay1, bx0, by0, bx1, by1):
     return False
 
 
-@ngjit
+@ngjit  # pragma: no cover
 def _point_in_ring(px, py, values, ring_start, ring_stop):
     """Winding-number point-in-polygon test for a single ring."""
     winding = 0
@@ -445,7 +445,7 @@ def _point_in_ring(px, py, values, ring_start, ring_stop):
     return winding != 0
 
 
-@ngpjit
+@ngpjit  # pragma: no cover
 def intersects_bounds_map1(x0, y0, x1, y1, values, offsets0, result, missing):
     """Test whether each list<float> geometry intersects the given bounding box."""
     n = len(offsets0) - 1

@@ -65,7 +65,12 @@ exclude_lines = [
     "except ImportError:",
     "raise NotImplementedError",
 ]
-fail_under = 70
+exclude_also = [
+    # Numba JIT function bodies cannot be traced by coverage
+    "@ngjit",
+    "@ngpjit",
+]
+fail_under = 75
 show_missing = true
 
 [tool.coverage.run]
