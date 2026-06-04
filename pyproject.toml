@@ -32,6 +32,8 @@ shapely     = ["shapely>=2.0"]
 convert     = ["shapely>=2.0"]
 geopandas   = ["geopandas", "shapely>=2.0"]
 spatialpandas = ["spatialpandas"]
+# GPU support via numba CUDA and cupy
+gpu         = ["cupy-cuda12x"]
 # Install everything
 full = ["shapely>=2.0", "geopandas", "spatialpandas"]
 test = [

@@ -257,7 +257,7 @@ def extract_interleaved(layout) -> tuple:
     geo : GeoLayout
         The detected geometry layout descriptor.
     """
-    import numpy as np
+    from akimbo_geo._compat import array_module
 
     geo = _geo_layout_of(layout)
     if geo is None:
@@ -266,9 +266,13 @@ def extract_interleaved(layout) -> tuple:
     offsets = []
     current = _unwrap(layout)
 
-    # Peel off List nesting levels, collecting offset arrays
+    # Peel off List nesting levels, collecting offset arrays.
+    # We use the raw .data attribute of the awkward Index object and cast to
+    # int32 *on the same device* — array_module detects numpy vs cupy.
     for _ in range(geo.list_depth):
-        offsets.append(np.asarray(current.offsets.data).astype(np.int32))
+        raw = current.offsets.data          # numpy.ndarray or cupy.ndarray
+        xp = array_module(raw)
+        offsets.append(xp.asarray(raw, dtype=xp.int32))
         current = _unwrap(current.content)
 
     # current is now the coordinate leaf node
@@ -277,27 +281,39 @@ def extract_interleaved(layout) -> tuple:
 
 
 def _extract_coord_values(layout, coord_kind: CoordKind, n_dims: int):
-    """Extract a flat interleaved float64 array from a coordinate leaf."""
-    import numpy as np
+    """Extract a flat interleaved float64 array from a coordinate leaf.
+
+    The returned array lives on the *same device* as the input data — it is
+    a numpy array for CPU layouts and a cupy array for GPU layouts.  The
+    calling code must not assume numpy; use ``_compat.array_module(values)``
+    to branch on device type.
+    """
+    from akimbo_geo._compat import array_module
 
     layout = _unwrap(layout)
 
     if coord_kind == CoordKind.INTERLEAVED_FLAT:
-        # NumpyArray — flat buffer, already interleaved
-        return np.asarray(layout.data).astype(np.float64)
+        # NumpyArray (or cupy equivalent) — flat buffer, already interleaved
+        raw = layout.data
+        xp = array_module(raw)
+        return xp.asarray(raw, dtype=xp.float64)
 
     if coord_kind == CoordKind.INTERLEAVED_FSL:
         # RegularArray(size=n_dims, NumpyArray) — flat buffer, already interleaved
         leaf = _unwrap(layout.content)
-        return np.asarray(leaf.data).astype(np.float64)
+        raw  = leaf.data
+        xp   = array_module(raw)
+        return xp.asarray(raw, dtype=xp.float64)
 
     if coord_kind == CoordKind.SEPARATED_STRUCT:
-        # RecordArray with separate per-dimension NumpyArrays
-        # Interleave them: [x0,y0,x1,y1,...] or [x0,y0,z0,x1,y1,z1,...]
-        arrays = [np.asarray(_unwrap(c).data).astype(np.float64)
-                  for c in layout.contents[:n_dims]]
+        # RecordArray with separate per-dimension arrays.
+        # Interleave: [x0,y0,x1,y1,...] or [x0,y0,z0,x1,y1,z1,...]
+        # All component arrays must live on the same device.
+        raw_arrays = [_unwrap(c).data for c in layout.contents[:n_dims]]
+        xp = array_module(raw_arrays[0])
+        arrays = [xp.asarray(a, dtype=xp.float64) for a in raw_arrays]
         n_pts = len(arrays[0])
-        out = np.empty(n_pts * n_dims, dtype=np.float64)
+        out = xp.empty(n_pts * n_dims, dtype=xp.float64)
         for i, arr in enumerate(arrays):
             out[i::n_dims] = arr
         return out

@@ -44,7 +44,7 @@ from akimbo.apply_tree import dec
 from akimbo.mixin import EagerAccessor, LazyAccessor
 
 from akimbo_geo import algorithms as alg
-from akimbo_geo._compat import require_shapely
+from akimbo_geo._compat import array_module, is_gpu_array, require_shapely
 from akimbo_geo.match import (
     CoordKind,
     GeoLayout,
@@ -60,331 +60,518 @@ from akimbo_geo.match import (
 
 
 # ===========================================================================
+# Backend-dispatch helpers
+# ===========================================================================
+
+def _alg_gpu():
+    """Lazily import algorithms_gpu to avoid importing numba.cuda on CPU-only systems."""
+    from akimbo_geo import algorithms_gpu
+    return algorithms_gpu
+
+
+def _xp_full(n, fill, dtype, xp):
+    """Create a filled array on the correct device."""
+    return xp.full(n, fill, dtype=dtype)
+
+
+def _xp_zeros(n, dtype, xp):
+    return xp.zeros(n, dtype=dtype)
+
+
+def _xp_empty(n, dtype, xp):
+    return xp.empty(n, dtype=dtype)
+
+
+# ===========================================================================
 # Offset scaling helper
 # ===========================================================================
 
 def _scale_offsets(offsets, geo: GeoLayout):
     """Scale point-indexed offsets to float-indexed offsets for the kernels.
 
-    The numba kernels from spatialpandas expect offsets that index directly
-    into the flat float buffer.  For INTERLEAVED_FLAT the Arrow offsets
-    already do this (one offset unit = one float).  For FSL and STRUCT, the
-    Arrow list offsets count *coordinate points*, so we multiply by n_dims.
+    The numba kernels expect offsets that index directly into the flat float
+    buffer.  For INTERLEAVED_FLAT the Arrow offsets already do this.
+    For FSL and STRUCT, offsets count coordinate *points*, so multiply by n_dims.
+    Works on both numpy and cupy arrays (arithmetic is device-transparent).
     """
     if geo.coord_kind == CoordKind.INTERLEAVED_FLAT:
-        return offsets   # already in float units
-    # FSL or STRUCT: offsets are in point units, scale to float units
+        return offsets
     return tuple(o * geo.n_dims for o in offsets)
+
+
+# ===========================================================================
+# Layout reconstruction helpers — direct ak.contents, no PyArrow round-trip
+# ===========================================================================
+
+def _wrap_in_list(values_array, offsets_array) -> ak.contents.Content:
+    """Wrap a flat array in a ListOffsetArray using raw ak.contents constructors.
+
+    This avoids serialising through PyArrow (``pa.array`` + ``pa.ListArray``)
+    and works with both numpy and cupy arrays because ``ak.index.Index32``
+    accepts any array-protocol object.
+    """
+    return ak.contents.ListOffsetArray(
+        ak.index.Index32(offsets_array),
+        ak.contents.NumpyArray(values_array),
+    )
+
+
+def _wrap_in_regular(values_array, size: int) -> ak.contents.Content:
+    """Wrap a flat array in a RegularArray (FixedSizeList) of the given size."""
+    return ak.contents.RegularArray(
+        ak.contents.NumpyArray(values_array),
+        size=size,
+    )
 
 
 def _rebuild_list1(values_flat, offsets0_float, geo: GeoLayout) -> ak.contents.Content:
     """Rebuild a depth-1 geometry layout from a (possibly new) flat values buffer.
 
-    When a kernel produces a new coordinate buffer with the same offsets
-    (e.g. translate, scale, affine_transform, reverse), we re-wrap it in the
-    same Arrow list structure so the output has the same type as the input.
+    Uses direct ``ak.contents`` construction — no PyArrow round-trip.
+    Works on both CPU (numpy) and GPU (cupy) arrays.
     """
-    # Offsets are always in float units here (already scaled)
-    if geo.coord_kind in (CoordKind.INTERLEAVED_FSL, CoordKind.SEPARATED_STRUCT):
-        # Convert back to point-unit offsets for the output Arrow type.
+    if geo.coord_kind == CoordKind.INTERLEAVED_FSL:
         pt_offsets = offsets0_float // geo.n_dims
-        # Build as FixedSizeList if input was FSL
-        if geo.coord_kind == CoordKind.INTERLEAVED_FSL:
-            # Reshape flat buffer → (N_pts, n_dims) for FixedSizeList
-            pts = values_flat.reshape(-1, geo.n_dims)
-            return ak.from_arrow(
-                pa.FixedSizeListArray.from_arrays(
-                    pa.array(values_flat), geo.n_dims
-                )
-            ).layout
-        else:
-            # SEPARATED_STRUCT: de-interleave back to struct
-            arrays = [pa.array(values_flat[d::geo.n_dims]) for d in range(geo.n_dims)]
-            dim_names = ["x", "y", "z", "m"][: geo.n_dims]
-            pa_struct = pa.StructArray.from_arrays(arrays, names=dim_names)
-            return ak.from_arrow(
-                pa.ListArray.from_arrays(
-                    pa.array(pt_offsets, type=pa.int32()),
-                    pa_struct,
-                )
-            ).layout
+        # Outer ListOffsetArray of RegularArray(size=n_dims)
+        return ak.contents.ListOffsetArray(
+            ak.index.Index32(pt_offsets),
+            _wrap_in_regular(values_flat, geo.n_dims),
+        )
+    elif geo.coord_kind == CoordKind.SEPARATED_STRUCT:
+        pt_offsets = offsets0_float // geo.n_dims
+        xp = array_module(values_flat)
+        dim_names = ["x", "y", "z", "m"][: geo.n_dims]
+        contents = [
+            ak.contents.NumpyArray(xp.ascontiguousarray(values_flat[d::geo.n_dims]))
+            for d in range(geo.n_dims)
+        ]
+        return ak.contents.ListOffsetArray(
+            ak.index.Index32(pt_offsets),
+            ak.contents.RecordArray(contents, dim_names),
+        )
     else:
-        # INTERLEAVED_FLAT: wrap directly
-        return ak.from_arrow(
-            pa.ListArray.from_arrays(
-                pa.array(offsets0_float, type=pa.int32()),
-                pa.array(values_flat, type=pa.float64()),
+        # INTERLEAVED_FLAT — plain flat list
+        return _wrap_in_list(values_flat, offsets0_float)
+
+
+def _rebuild_depth(values_flat, offsets_float, geo: GeoLayout) -> ak.contents.Content:
+    """Rebuild an arbitrary-depth geometry layout from a new flat buffer.
+
+    Uses direct ``ak.contents`` construction throughout — no PyArrow.
+    Works on both CPU and GPU arrays.
+
+    - depth-0 (Point): plain NumpyArray or RegularArray(size=n_dims)
+    - n_dims == 2: INTERLEAVED_FLAT list<float>
+    - n_dims >= 3: list<RegularArray(size=n_dims)> so n_dims is recoverable
+    """
+    # depth-0: no list wrapping
+    if len(offsets_float) == 0:
+        if geo.n_dims == 2:
+            return ak.contents.NumpyArray(values_flat)
+        else:
+            return _wrap_in_regular(values_flat, geo.n_dims)
+
+    if geo.n_dims == 2:
+        if len(offsets_float) == 1:
+            return _rebuild_list1(values_flat, offsets_float[0], geo)
+        # depth-2+: innermost = flat list, then wrap outer levels
+        inner = _wrap_in_list(values_flat, offsets_float[-1])
+    else:
+        # FixedSizeList[n_dims] leaf — n_dims is preserved on round-trip
+        fsl = _wrap_in_regular(values_flat, geo.n_dims)
+        if len(offsets_float) >= 1:
+            pt_offsets = offsets_float[-1] // geo.n_dims
+            inner = ak.contents.ListOffsetArray(
+                ak.index.Index32(pt_offsets), fsl
             )
-        ).layout
+        else:
+            inner = fsl
+
+    # Wrap remaining outer levels
+    for off in reversed(offsets_float[:-1]):
+        inner = ak.contents.ListOffsetArray(
+            ak.index.Index32(off),
+            inner,
+        )
+    return inner
 
 
 # ===========================================================================
-# Op functions — existing measurements
+# Op functions — all pure-numba operations
+#
+# Pattern: extract values + offsets (on whatever device the data is on),
+# determine xp = array_module(values), allocate output on the same device,
+# then dispatch to the CPU (alg.*) or GPU (alg_gpu.launch_*) kernel.
 # ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Measurements
+# ---------------------------------------------------------------------------
 
 def _op_length(layout):
     """Length for depth-1 geometries (Line / Ring / MultiPoint)."""
     values, offsets, geo = extract_offsets_and_values(layout)
     off0, = _scale_offsets(offsets, geo)
+    xp = array_module(values)
     n = len(off0) - 1
-    result = np.full(n, np.nan, dtype=np.float64)
-    missing = np.zeros(n, dtype=np.bool_)
-    alg.length_map1(values, off0, result, missing)
-    return ak.Array(result).layout
+    result = xp.full(n, xp.nan, dtype=xp.float64)
+    if is_gpu_array(values):
+        _alg_gpu().launch_length_map1(values, off0, result)
+    else:
+        missing = xp.zeros(n, dtype=xp.bool_)
+        alg.length_map1(values, off0, result, missing)
+    return ak.contents.NumpyArray(result)
 
 
 def _op_length2(layout):
     """Length for depth-2 geometries (MultiLine / Polygon perimeter)."""
     values, offsets, geo = extract_offsets_and_values(layout)
     off0, off1 = _scale_offsets(offsets, geo)
+    xp = array_module(values)
     n = len(off0) - 1
-    result = np.full(n, np.nan, dtype=np.float64)
-    missing = np.zeros(n, dtype=np.bool_)
-    alg.length_map2(values, off0, off1, result, missing)
-    return ak.Array(result).layout
+    result = xp.full(n, xp.nan, dtype=xp.float64)
+    if is_gpu_array(values):
+        _alg_gpu().launch_length_map2(values, off0, off1, result)
+    else:
+        missing = xp.zeros(n, dtype=xp.bool_)
+        alg.length_map2(values, off0, off1, result, missing)
+    return ak.contents.NumpyArray(result)
 
 
 def _op_length3(layout):
     """Length for depth-3 geometries (MultiPolygon perimeter)."""
     values, offsets, geo = extract_offsets_and_values(layout)
     off0, off1, off2 = _scale_offsets(offsets, geo)
+    xp = array_module(values)
     n = len(off0) - 1
-    result = np.full(n, np.nan, dtype=np.float64)
-    missing = np.zeros(n, dtype=np.bool_)
-    alg.length_map3(values, off0, off1, off2, result, missing)
-    return ak.Array(result).layout
+    result = xp.full(n, xp.nan, dtype=xp.float64)
+    if is_gpu_array(values):
+        _alg_gpu().launch_length_map3(values, off0, off1, off2, result)
+    else:
+        missing = xp.zeros(n, dtype=xp.bool_)
+        alg.length_map3(values, off0, off1, off2, result, missing)
+    return ak.contents.NumpyArray(result)
 
 
 def _op_area(layout):
     """Area for depth-2 geometries (Polygon / MultiLine)."""
     values, offsets, geo = extract_offsets_and_values(layout)
     off0, off1 = _scale_offsets(offsets, geo)
+    xp = array_module(values)
     n = len(off0) - 1
-    result = np.full(n, np.nan, dtype=np.float64)
-    missing = np.zeros(n, dtype=np.bool_)
-    alg.area_map2(values, off0, off1, result, missing)
-    return ak.Array(result).layout
+    result = xp.full(n, xp.nan, dtype=xp.float64)
+    if is_gpu_array(values):
+        _alg_gpu().launch_area_map2(values, off0, off1, result)
+    else:
+        missing = xp.zeros(n, dtype=xp.bool_)
+        alg.area_map2(values, off0, off1, result, missing)
+    return ak.contents.NumpyArray(result)
 
 
 def _op_area3(layout):
     """Area for depth-3 geometries (MultiPolygon)."""
     values, offsets, geo = extract_offsets_and_values(layout)
     off0, off1, off2 = _scale_offsets(offsets, geo)
+    xp = array_module(values)
     n = len(off0) - 1
-    result = np.full(n, np.nan, dtype=np.float64)
-    missing = np.zeros(n, dtype=np.bool_)
-    alg.area_map3(values, off0, off1, off2, result, missing)
-    return ak.Array(result).layout
+    result = xp.full(n, xp.nan, dtype=xp.float64)
+    if is_gpu_array(values):
+        _alg_gpu().launch_area_map3(values, off0, off1, off2, result)
+    else:
+        missing = xp.zeros(n, dtype=xp.bool_)
+        alg.area_map3(values, off0, off1, off2, result, missing)
+    return ak.contents.NumpyArray(result)
 
 
 def _op_bounds(layout):
     """Bounding box for any geometry — returns record{xmin,ymin,xmax,ymax}."""
     values, offsets, geo = extract_offsets_and_values(layout)
     scaled = _scale_offsets(offsets, geo)
+    xp = array_module(values)
     n = len(scaled[0]) - 1
-    result = np.full((n, 4), np.nan, dtype=np.float64)
-    missing = np.zeros(n, dtype=np.bool_)
-    if len(scaled) == 1:
-        alg.bounds_map1(values, scaled[0], result, missing)
-    elif len(scaled) == 2:
-        alg.bounds_map2(values, scaled[0], scaled[1], result, missing)
+    result = xp.full((n, 4), xp.nan, dtype=xp.float64)
+    if is_gpu_array(values):
+        gpu = _alg_gpu()
+        if len(scaled) == 1:
+            gpu.launch_bounds_map1(values, scaled[0], result)
+        elif len(scaled) == 2:
+            gpu.launch_bounds_map2(values, scaled[0], scaled[1], result)
+        else:
+            gpu.launch_bounds_map3(values, scaled[0], scaled[1], scaled[2], result)
     else:
-        alg.bounds_map3(values, scaled[0], scaled[1], scaled[2], result, missing)
-    return ak.Array(
-        {"xmin": result[:, 0], "ymin": result[:, 1],
-         "xmax": result[:, 2], "ymax": result[:, 3]}
-    ).layout
+        missing = xp.zeros(n, dtype=xp.bool_)
+        if len(scaled) == 1:
+            alg.bounds_map1(values, scaled[0], result, missing)
+        elif len(scaled) == 2:
+            alg.bounds_map2(values, scaled[0], scaled[1], result, missing)
+        else:
+            alg.bounds_map3(values, scaled[0], scaled[1], scaled[2], result, missing)
+    return ak.contents.RecordArray(
+        [ak.contents.NumpyArray(result[:, 0]),
+         ak.contents.NumpyArray(result[:, 1]),
+         ak.contents.NumpyArray(result[:, 2]),
+         ak.contents.NumpyArray(result[:, 3])],
+        ["xmin", "ymin", "xmax", "ymax"],
+    )
 
 
 def _op_centroid1(layout):
     """Centroid (mean of coords) for depth-1 geometries."""
     values, offsets, geo = extract_offsets_and_values(layout)
     off0, = _scale_offsets(offsets, geo)
+    xp = array_module(values)
     n = len(off0) - 1
-    result_x = np.full(n, np.nan, dtype=np.float64)
-    result_y = np.full(n, np.nan, dtype=np.float64)
-    missing = np.zeros(n, dtype=np.bool_)
-    alg.centroid_map1(values, off0, result_x, result_y, missing)
-    return ak.Array({"x": result_x, "y": result_y}).layout
+    result_x = xp.full(n, xp.nan, dtype=xp.float64)
+    result_y = xp.full(n, xp.nan, dtype=xp.float64)
+    if is_gpu_array(values):
+        _alg_gpu().launch_centroid_map1(values, off0, result_x, result_y)
+    else:
+        missing = xp.zeros(n, dtype=xp.bool_)
+        alg.centroid_map1(values, off0, result_x, result_y, missing)
+    return ak.contents.RecordArray(
+        [ak.contents.NumpyArray(result_x), ak.contents.NumpyArray(result_y)],
+        ["x", "y"],
+    )
 
 
 def _op_centroid2(layout):
     """Area-weighted centroid for depth-2 polygon geometries."""
     values, offsets, geo = extract_offsets_and_values(layout)
     off0, off1 = _scale_offsets(offsets, geo)
+    xp = array_module(values)
     n = len(off0) - 1
-    result_x = np.full(n, np.nan, dtype=np.float64)
-    result_y = np.full(n, np.nan, dtype=np.float64)
-    missing = np.zeros(n, dtype=np.bool_)
-    alg.centroid_map2(values, off0, off1, result_x, result_y, missing)
-    return ak.Array({"x": result_x, "y": result_y}).layout
+    result_x = xp.full(n, xp.nan, dtype=xp.float64)
+    result_y = xp.full(n, xp.nan, dtype=xp.float64)
+    if is_gpu_array(values):
+        _alg_gpu().launch_centroid_map2(values, off0, off1, result_x, result_y)
+    else:
+        missing = xp.zeros(n, dtype=xp.bool_)
+        alg.centroid_map2(values, off0, off1, result_x, result_y, missing)
+    return ak.contents.RecordArray(
+        [ak.contents.NumpyArray(result_x), ak.contents.NumpyArray(result_y)],
+        ["x", "y"],
+    )
 
 
 def _op_intersects_bounds(layout, x0, y0, x1, y1):
     """Boolean: does each depth-1 geometry intersect bounding box?"""
     values, offsets, geo = extract_offsets_and_values(layout)
     off0, = _scale_offsets(offsets, geo)
+    xp = array_module(values)
     n = len(off0) - 1
-    result = np.zeros(n, dtype=np.bool_)
-    missing = np.zeros(n, dtype=np.bool_)
-    alg.intersects_bounds_map1(
-        float(x0), float(y0), float(x1), float(y1),
-        values, off0, result, missing
-    )
-    return ak.Array(result).layout
+    result = xp.zeros(n, dtype=xp.bool_)
+    # intersects_bounds has no GPU kernel yet — fall back to CPU via .get()
+    if is_gpu_array(values):
+        from akimbo_geo._compat import gpu_array_to_numpy
+        cpu_vals = gpu_array_to_numpy(values)
+        cpu_off0 = gpu_array_to_numpy(off0)
+        cpu_res  = np.zeros(n, dtype=np.bool_)
+        missing  = np.zeros(n, dtype=np.bool_)
+        alg.intersects_bounds_map1(float(x0), float(y0), float(x1), float(y1),
+                                    cpu_vals, cpu_off0, cpu_res, missing)
+        result = xp.asarray(cpu_res)
+    else:
+        missing = xp.zeros(n, dtype=xp.bool_)
+        alg.intersects_bounds_map1(float(x0), float(y0), float(x1), float(y1),
+                                    values, off0, result, missing)
+    return ak.contents.NumpyArray(result)
 
 
-# ===========================================================================
-# Op functions — NEW: counting
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# Counting
+# ---------------------------------------------------------------------------
 
 def _op_count_coords(layout):
     """Number of coordinate points per depth-1 geometry."""
     values, offsets, geo = extract_offsets_and_values(layout)
     off0, = _scale_offsets(offsets, geo)
+    xp = array_module(values)
     n = len(off0) - 1
-    result = np.zeros(n, dtype=np.int64)
-    missing = np.zeros(n, dtype=np.bool_)
-    alg.count_coords_map1(off0, geo.n_dims, result, missing)
-    return ak.Array(result).layout
+    result = xp.zeros(n, dtype=xp.int64)
+    if is_gpu_array(values):
+        _alg_gpu().launch_count_coords_map1(off0, geo.n_dims, result)
+    else:
+        missing = xp.zeros(n, dtype=xp.bool_)
+        alg.count_coords_map1(off0, geo.n_dims, result, missing)
+    return ak.contents.NumpyArray(result)
 
 
 def _op_count_geoms(layout):
     """Number of sub-geometries per depth-2 geometry."""
     values, offsets, geo = extract_offsets_and_values(layout)
-    off0, _off1 = _scale_offsets(offsets, geo)
-    # off0 is the outer-level offset; count sub-geoms from the unscaled off0
-    # (point-unit counts are what we want, divide by n_dims only for values)
-    # Actually: the count of sub-geometries comes from the outer Arrow offsets
-    # regardless of coord kind — it counts items in the outer list.
-    outer_offsets = offsets[0]  # unscaled point/item units
+    outer_offsets = offsets[0]
+    xp = array_module(outer_offsets)
     n = len(outer_offsets) - 1
-    result = np.zeros(n, dtype=np.int64)
-    missing = np.zeros(n, dtype=np.bool_)
-    alg.count_geoms_map2(outer_offsets, result, missing)
-    return ak.Array(result).layout
+    result = xp.zeros(n, dtype=xp.int64)
+    if is_gpu_array(outer_offsets):
+        _alg_gpu().launch_count_geoms_map2(outer_offsets, result)
+    else:
+        missing = xp.zeros(n, dtype=xp.bool_)
+        alg.count_geoms_map2(outer_offsets, result, missing)
+    return ak.contents.NumpyArray(result)
 
 
 def _op_count_interior_rings(layout):
     """Number of interior rings (holes) per depth-2 polygon geometry."""
     values, offsets, geo = extract_offsets_and_values(layout)
-    outer_offsets = offsets[0]  # item-unit outer offsets (ring counts)
+    outer_offsets = offsets[0]
+    xp = array_module(outer_offsets)
     n = len(outer_offsets) - 1
-    result = np.zeros(n, dtype=np.int64)
-    missing = np.zeros(n, dtype=np.bool_)
-    alg.count_interior_rings_map2(outer_offsets, result, missing)
-    return ak.Array(result).layout
+    result = xp.zeros(n, dtype=xp.int64)
+    if is_gpu_array(outer_offsets):
+        _alg_gpu().launch_count_interior_rings_map2(outer_offsets, result)
+    else:
+        missing = xp.zeros(n, dtype=xp.bool_)
+        alg.count_interior_rings_map2(outer_offsets, result, missing)
+    return ak.contents.NumpyArray(result)
 
 
-# ===========================================================================
-# Op functions — NEW: predicates
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# Predicates
+# ---------------------------------------------------------------------------
 
 def _op_is_closed(layout):
     """True if first coord == last coord for each depth-1 geometry."""
     values, offsets, geo = extract_offsets_and_values(layout)
     off0, = _scale_offsets(offsets, geo)
+    xp = array_module(values)
     n = len(off0) - 1
-    result = np.zeros(n, dtype=np.bool_)
-    missing = np.zeros(n, dtype=np.bool_)
-    alg.is_closed_map1(values, off0, result, missing)
-    return ak.Array(result).layout
+    result = xp.zeros(n, dtype=xp.bool_)
+    if is_gpu_array(values):
+        _alg_gpu().launch_is_closed_map1(values, off0, result)
+    else:
+        missing = xp.zeros(n, dtype=xp.bool_)
+        alg.is_closed_map1(values, off0, result, missing)
+    return ak.contents.NumpyArray(result)
+
+
+def _op_is_ring(layout):
+    """True if each depth-1 geometry is a closed ring with >= 4 points."""
+    values, offsets, geo = extract_offsets_and_values(layout)
+    off0, = _scale_offsets(offsets, geo)
+    xp = array_module(values)
+    n = len(off0) - 1
+    result = xp.zeros(n, dtype=xp.bool_)
+    if is_gpu_array(values):
+        _alg_gpu().launch_is_ring_map1(values, off0, result)
+    else:
+        missing = xp.zeros(n, dtype=xp.bool_)
+        alg.is_ring_map1(values, off0, result, missing)
+    return ak.contents.NumpyArray(result)
 
 
 def _op_is_ccw(layout):
     """True if exterior ring is CCW for each depth-2 polygon geometry."""
     values, offsets, geo = extract_offsets_and_values(layout)
     off0, off1 = _scale_offsets(offsets, geo)
+    xp = array_module(values)
     n = len(off0) - 1
-    result = np.zeros(n, dtype=np.bool_)
-    missing = np.zeros(n, dtype=np.bool_)
-    alg.is_ccw_map2(values, off0, off1, result, missing)
-    return ak.Array(result).layout
+    result = xp.zeros(n, dtype=xp.bool_)
+    if is_gpu_array(values):
+        _alg_gpu().launch_is_ccw_map2(values, off0, off1, result)
+    else:
+        missing = xp.zeros(n, dtype=xp.bool_)
+        alg.is_ccw_map2(values, off0, off1, result, missing)
+    return ak.contents.NumpyArray(result)
 
 
 def _op_has_z(layout):
     """True if the geometry has a Z dimension (n_dims >= 3)."""
-    geo = _geo_layout_of(_unwrap(layout))
-    n_dims = geo.n_dims if geo is not None else 2
+    geo_desc = _geo_layout_of(_unwrap(layout))
+    n_dims = geo_desc.n_dims if geo_desc is not None else 2
     values, offsets, geo = extract_offsets_and_values(layout)
+    xp = array_module(values)
     n = len(offsets[0]) - 1
-    result = np.full(n, n_dims >= 3, dtype=np.bool_)
-    return ak.Array(result).layout
+    result = xp.full(n, n_dims >= 3, dtype=xp.bool_)
+    return ak.contents.NumpyArray(result)
 
 
 def _op_has_m(layout):
     """True if the geometry has an M dimension (n_dims >= 4)."""
-    geo = _geo_layout_of(_unwrap(layout))
-    n_dims = geo.n_dims if geo is not None else 2
-    values, offsets, geo2 = extract_offsets_and_values(layout)
+    geo_desc = _geo_layout_of(_unwrap(layout))
+    n_dims = geo_desc.n_dims if geo_desc is not None else 2
+    values, offsets, geo = extract_offsets_and_values(layout)
+    xp = array_module(values)
     n = len(offsets[0]) - 1
-    result = np.full(n, n_dims >= 4, dtype=np.bool_)
-    return ak.Array(result).layout
+    result = xp.full(n, n_dims >= 4, dtype=xp.bool_)
+    return ak.contents.NumpyArray(result)
 
 
-# ===========================================================================
-# Op functions — NEW: coordinate extraction (Point / depth-0)
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# Coordinate extraction (Point / depth-0)
+# ---------------------------------------------------------------------------
 
 def _op_get_x(layout):
     """Extract x coordinate for each depth-0 Point geometry."""
     values, offsets, geo = extract_offsets_and_values(layout)
-    # depth-0: no offsets, values IS the flat point buffer
+    xp = array_module(values)
     n = len(values) // geo.n_dims
-    result = np.empty(n, dtype=np.float64)
-    alg.get_x_map0(values, geo.n_dims, result)
-    return ak.Array(result).layout
+    result = xp.empty(n, dtype=xp.float64)
+    if is_gpu_array(values):
+        _alg_gpu().launch_get_x_map0(values, geo.n_dims, result)
+    else:
+        alg.get_x_map0(values, geo.n_dims, result)
+    return ak.contents.NumpyArray(result)
 
 
 def _op_get_y(layout):
     """Extract y coordinate for each depth-0 Point geometry."""
     values, offsets, geo = extract_offsets_and_values(layout)
+    xp = array_module(values)
     n = len(values) // geo.n_dims
-    result = np.empty(n, dtype=np.float64)
-    alg.get_y_map0(values, geo.n_dims, result)
-    return ak.Array(result).layout
+    result = xp.empty(n, dtype=xp.float64)
+    if is_gpu_array(values):
+        _alg_gpu().launch_get_y_map0(values, geo.n_dims, result)
+    else:
+        alg.get_y_map0(values, geo.n_dims, result)
+    return ak.contents.NumpyArray(result)
 
 
 def _op_get_z(layout):
     """Extract z coordinate for each depth-0 Point geometry (NaN if 2D)."""
     values, offsets, geo = extract_offsets_and_values(layout)
+    xp = array_module(values)
     n = len(values) // geo.n_dims
-    result = np.full(n, np.nan, dtype=np.float64)
-    alg.get_z_map0(values, geo.n_dims, result)
-    return ak.Array(result).layout
+    result = xp.full(n, xp.nan, dtype=xp.float64)
+    if is_gpu_array(values):
+        _alg_gpu().launch_get_z_map0(values, geo.n_dims, result)
+    else:
+        alg.get_z_map0(values, geo.n_dims, result)
+    return ak.contents.NumpyArray(result)
 
 
 def _op_get_coordinates(layout):
     """Return structured {x, y} record array for each depth-1 geometry."""
     values, offsets, geo = extract_offsets_and_values(layout)
     off0, = _scale_offsets(offsets, geo)
+    xp = array_module(values)
     n_floats = int(off0[-1])
-    n_pts = n_floats // 2  # always stride-2 in float units
     xs = values[:n_floats:2]
     ys = values[1:n_floats:2]
-    # Build a variable-length list of {x, y} records matching the input nesting
-    # Produce a ListArray of struct: offsets are in point units
     pt_offsets = off0 // 2
-    return ak.from_arrow(
-        pa.ListArray.from_arrays(
-            pa.array(pt_offsets.astype(np.int32), type=pa.int32()),
-            pa.StructArray.from_arrays(
-                [pa.array(xs), pa.array(ys)], names=["x", "y"]
-            ),
-        )
-    ).layout
+    return ak.contents.ListOffsetArray(
+        ak.index.Index32(pt_offsets),
+        ak.contents.RecordArray(
+            [ak.contents.NumpyArray(xs), ak.contents.NumpyArray(ys)],
+            ["x", "y"],
+        ),
+    )
 
 
-# ===========================================================================
-# Op functions — NEW: affine transformations
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# Affine transformations
+# ---------------------------------------------------------------------------
 
 def _op_translate(layout, xoff, yoff):
     """Translate (add xoff, yoff to every coordinate) for depth-1 geometries."""
     values, offsets, geo = extract_offsets_and_values(layout)
     off0, = _scale_offsets(offsets, geo)
-    result = np.empty_like(values)
-    alg.translate_map(values, off0, float(xoff), float(yoff), result)
+    xp = array_module(values)
+    result = xp.empty_like(values)
+    if is_gpu_array(values):
+        _alg_gpu().launch_translate_map(values, off0, float(xoff), float(yoff), result)
+    else:
+        alg.translate_map(values, off0, float(xoff), float(yoff), result)
     return _rebuild_list1(result, off0, geo)
 
 
@@ -392,37 +579,46 @@ def _op_scale(layout, xfact, yfact, origin):
     """Scale coordinates around an origin point for depth-1 geometries."""
     values, offsets, geo = extract_offsets_and_values(layout)
     off0, = _scale_offsets(offsets, geo)
+    xp = array_module(values)
     ox, oy = float(origin[0]), float(origin[1])
-    result = np.empty_like(values)
-    alg.scale_map(values, off0, float(xfact), float(yfact), ox, oy, result)
+    result = xp.empty_like(values)
+    if is_gpu_array(values):
+        _alg_gpu().launch_scale_map(values, off0, float(xfact), float(yfact),
+                                     ox, oy, result)
+    else:
+        alg.scale_map(values, off0, float(xfact), float(yfact), ox, oy, result)
     return _rebuild_list1(result, off0, geo)
 
 
 def _op_affine_transform(layout, matrix):
-    """Apply a 2D affine transform to depth-1 geometries.
-
-    matrix : sequence of 6 floats [a, b, d, e, xoff, yoff] where:
-        x' = a*x + b*y + xoff
-        y' = d*x + e*y + yoff
-    """
+    """Apply a 2D affine transform to depth-1 geometries."""
     values, offsets, geo = extract_offsets_and_values(layout)
     off0, = _scale_offsets(offsets, geo)
+    xp = array_module(values)
     a, b, d, e, xoff, yoff = (float(v) for v in matrix)
-    result = np.empty_like(values)
-    alg.affine_transform_map(values, off0, a, b, d, e, xoff, yoff, result)
+    result = xp.empty_like(values)
+    if is_gpu_array(values):
+        _alg_gpu().launch_affine_transform_map(values, off0, a, b, d, e,
+                                                xoff, yoff, result)
+    else:
+        alg.affine_transform_map(values, off0, a, b, d, e, xoff, yoff, result)
     return _rebuild_list1(result, off0, geo)
 
 
-# ===========================================================================
-# Op functions — NEW: coordinate manipulation
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# Coordinate manipulation
+# ---------------------------------------------------------------------------
 
 def _op_reverse(layout):
     """Reverse vertex order for each depth-1 geometry."""
     values, offsets, geo = extract_offsets_and_values(layout)
     off0, = _scale_offsets(offsets, geo)
-    result = np.empty_like(values)
-    alg.reverse_map1(values, off0, result)
+    xp = array_module(values)
+    result = xp.empty_like(values)
+    if is_gpu_array(values):
+        _alg_gpu().launch_reverse_map1(values, off0, result)
+    else:
+        alg.reverse_map1(values, off0, result)
     return _rebuild_list1(result, off0, geo)
 
 
@@ -430,16 +626,17 @@ def _op_force_2d(layout):
     """Drop Z/M coordinates, keeping only X and Y, for any geometry depth."""
     values, offsets, geo = extract_offsets_and_values(layout)
     if geo.n_dims == 2:
-        return layout  # already 2D — return unchanged
+        return layout
+    xp = array_module(values)
     n_pts = len(values) // geo.n_dims
-    result_2d = np.empty(n_pts * 2, dtype=np.float64)
-    alg.force_2d_map(values, geo.n_dims, result_2d)
-    # Rebuild offsets in float-2D units
+    result_2d = xp.empty(n_pts * 2, dtype=xp.float64)
+    if is_gpu_array(values):
+        _alg_gpu().launch_force_2d_map(values, geo.n_dims, result_2d)
+    else:
+        alg.force_2d_map(values, geo.n_dims, result_2d)
     new_geo = GeoLayout(CoordKind.INTERLEAVED_FLAT, 2, geo.list_depth)
-    # Offsets must be rescaled: old float offsets / n_dims * 2
-    scaled = _scale_offsets(offsets, geo)  # float-unit offsets for old n_dims
+    scaled = _scale_offsets(offsets, geo)
     new_offsets = tuple(o * 2 // geo.n_dims for o in scaled)
-    # Reconstruct by wrapping new flat 2D buffer in the same list structure
     return _rebuild_depth(result_2d, new_offsets, new_geo)
 
 
@@ -447,82 +644,58 @@ def _op_force_3d(layout, z_val):
     """Add a constant Z coordinate to 2D geometries."""
     values, offsets, geo = extract_offsets_and_values(layout)
     if geo.n_dims >= 3:
-        return layout  # already has Z — return unchanged
+        return layout
+    xp = array_module(values)
     n_pts = len(values) // geo.n_dims
-    result_3d = np.empty(n_pts * 3, dtype=np.float64)
-    alg.force_3d_map(values, float(z_val), result_3d)
+    result_3d = xp.empty(n_pts * 3, dtype=xp.float64)
+    if is_gpu_array(values):
+        _alg_gpu().launch_force_3d_map(values, float(z_val), result_3d)
+    else:
+        alg.force_3d_map(values, float(z_val), result_3d)
     new_geo = GeoLayout(CoordKind.INTERLEAVED_FLAT, 3, geo.list_depth)
     scaled = _scale_offsets(offsets, geo)
     new_offsets = tuple(o * 3 // geo.n_dims for o in scaled)
     return _rebuild_depth(result_3d, new_offsets, new_geo)
 
 
-def _rebuild_depth(values_flat, offsets_float, geo: GeoLayout) -> ak.contents.Content:
-    """Rebuild an arbitrary-depth geometry layout from a new flat buffer.
-
-    When n_dims == 2 the output is INTERLEAVED_FLAT (plain list<float>).
-    When n_dims >= 3 the output wraps coordinates in FixedSizeList[n_dims]
-    so that the matcher can recover the correct n_dims on the round-trip.
-    depth==0 (Point) returns a FixedSizeList[n_dims] or plain NumpyArray.
-    """
-    # depth-0: no list wrapping — just the flat coordinate buffer
-    if len(offsets_float) == 0:
-        if geo.n_dims == 2:
-            return ak.from_arrow(pa.array(values_flat, type=pa.float64())).layout
+def _op_minimum_bounding_radius(layout):
+    """Approximate minimum bounding radius (half bbox diagonal) per geometry."""
+    values, offsets, geo = extract_offsets_and_values(layout)
+    scaled = _scale_offsets(offsets, geo)
+    xp = array_module(values)
+    n = len(scaled[0]) - 1
+    result = xp.full(n, xp.nan, dtype=xp.float64)
+    if is_gpu_array(values):
+        gpu = _alg_gpu()
+        if len(scaled) == 1:
+            gpu.launch_minimum_bounding_radius_map1(values, scaled[0], result)
         else:
-            return ak.from_arrow(
-                pa.FixedSizeListArray.from_arrays(
-                    pa.array(values_flat, type=pa.float64()), geo.n_dims
-                )
-            ).layout
-
-    if geo.n_dims == 2:
-        # INTERLEAVED_FLAT — innermost list is plain floats
-        if len(offsets_float) == 1:
-            return _rebuild_list1(values_flat, offsets_float[0], geo)
-        # depth-2+: wrap from inside out
-        inner_arr = ak.from_arrow(
-            pa.ListArray.from_arrays(
-                pa.array(offsets_float[-1].astype(np.int32), type=pa.int32()),
-                pa.array(values_flat, type=pa.float64()),
-            )
-        )
+            gpu.launch_minimum_bounding_radius_map2(values, scaled[0], scaled[1], result)
     else:
-        # FixedSizeList[n_dims] coordinate leaf so n_dims is recoverable
-        n_pts = len(values_flat) // geo.n_dims
-        inner_arr = ak.from_arrow(
-            pa.FixedSizeListArray.from_arrays(
-                pa.array(values_flat, type=pa.float64()), geo.n_dims
-            )
-        )
-        # Wrap in list using the innermost offset (point-unit)
-        if len(offsets_float) >= 1:
-            pt_offsets = offsets_float[-1] // geo.n_dims
-            inner_arr = ak.from_arrow(
-                pa.ListArray.from_arrays(
-                    pa.array(pt_offsets.astype(np.int32), type=pa.int32()),
-                    ak.to_arrow(inner_arr, extensionarray=False),
-                )
-            )
-
-    # Middle levels (for depth > 1)
-    for off in reversed(offsets_float[:-1]):
-        inner_arr = ak.from_arrow(
-            pa.ListArray.from_arrays(
-                pa.array(off.astype(np.int32), type=pa.int32()),
-                ak.to_arrow(inner_arr, extensionarray=False),
-            )
-        )
-    return inner_arr.layout
+        missing = xp.zeros(n, dtype=xp.bool_)
+        if len(scaled) == 1:
+            alg.minimum_bounding_radius_map1(values, scaled[0], result, missing)
+        else:
+            alg.minimum_bounding_radius_map2(values, scaled[0], scaled[1], result, missing)
+    return ak.contents.NumpyArray(result)
 
 
 def _op_segmentize(layout, max_segment_length):
-    """Insert intermediate points so no edge exceeds max_segment_length."""
+    """Insert intermediate points so no edge exceeds max_segment_length.
+
+    segmentize uses a sequential two-pass algorithm that cannot run in a
+    simple CUDA thread-per-geometry pattern (pass-1 must complete for all
+    geometries before pass-2 can be sized and launched).  For GPU data we
+    fall back to CPU by transferring the coordinate and offset arrays.
+    """
     values, offsets, geo = extract_offsets_and_values(layout)
     off0, = _scale_offsets(offsets, geo)
+    if is_gpu_array(values):
+        from akimbo_geo._compat import gpu_array_to_numpy
+        values = gpu_array_to_numpy(values)
+        off0   = gpu_array_to_numpy(off0)
     max_len = float(max_segment_length)
     n = len(off0) - 1
-    # First pass: count output points
     n_out_pts = int(alg.segmentize_count(values, off0, max_len))
     result = np.empty(n_out_pts * 2, dtype=np.float64)
     new_offsets = np.zeros(n + 1, dtype=np.int64)
@@ -545,31 +718,6 @@ def _op_orient_polygons(layout, exterior_cw):
 # Op functions — Tier 1 (pure numba, no shapely)
 # ===========================================================================
 
-def _op_is_ring(layout):
-    """True if each depth-1 geometry is a closed ring with >= 4 points."""
-    values, offsets, geo = extract_offsets_and_values(layout)
-    off0, = _scale_offsets(offsets, geo)
-    n = len(off0) - 1
-    result = np.zeros(n, dtype=np.bool_)
-    missing = np.zeros(n, dtype=np.bool_)
-    alg.is_ring_map1(values, off0, result, missing)
-    return ak.Array(result).layout
-
-
-def _op_minimum_bounding_radius(layout):
-    """Approximate minimum bounding radius (half bbox diagonal) per geometry."""
-    values, offsets, geo = extract_offsets_and_values(layout)
-    scaled = _scale_offsets(offsets, geo)
-    n = len(scaled[0]) - 1
-    result = np.full(n, np.nan, dtype=np.float64)
-    missing = np.zeros(n, dtype=np.bool_)
-    if len(scaled) == 1:
-        alg.minimum_bounding_radius_map1(values, scaled[0], result, missing)
-    else:
-        alg.minimum_bounding_radius_map2(values, scaled[0], scaled[1], result, missing)
-    return ak.Array(result).layout
-
-
 # ===========================================================================
 # Shapely bridge helpers
 # ===========================================================================
@@ -579,6 +727,10 @@ def _layout_to_shapely(layout):
 
     Uses ``shapely.from_ragged_array`` with our flat coordinate buffer and
     the correctly ordered point-unit offsets — no WKB serialisation.
+
+    Raises ``TypeError`` if the data lives on a GPU device, because GEOS
+    operates on CPU memory only.  Call ``.to_backend('cpu')`` on the array
+    first, or use a pure-numba operation instead.
 
     Our ``extract_offsets_and_values`` returns offsets in *outermost-first*
     order (off0 = geom→ring/line, off1 = ring/line→float, ...).  Shapely's
@@ -599,6 +751,15 @@ def _layout_to_shapely(layout):
     from shapely import GeometryType
 
     values, offsets, geo = extract_offsets_and_values(layout)
+
+    # Shapely / GEOS runs on CPU only.  Reject GPU data with a clear message.
+    if is_gpu_array(values):
+        raise TypeError(
+            "Shapely-backed operations require CPU data; this array lives on "
+            "the GPU.  Transfer to CPU first with arr.to_backend('cpu'), or "
+            "use a pure-numba operation (area, length, bounds, translate, …)."
+        )
+
     coords = values.reshape(-1, geo.n_dims)  # (N_pts, n_dims) — zero-copy view
 
     # offsets are float-unit for FLAT, point-unit for FSL/STRUCT.
