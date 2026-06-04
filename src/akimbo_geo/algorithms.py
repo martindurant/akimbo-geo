@@ -848,3 +848,66 @@ def orient_polygons_map2(values, offsets0, offsets1, exterior_cw):
                 want_positive = exterior_cw
                 if (want_positive and area < 0.0) or (not want_positive and area > 0.0):
                     reverse_ring_inplace(values, rs, re)
+
+
+# ===========================================================================
+# Tier-1 pure-numba additions (no shapely required)
+# ===========================================================================
+
+@ngpjit  # pragma: no cover
+def is_ring_map1(values, offsets0, result, missing):
+    """True if each depth-1 geometry is a valid ring (closed, >= 4 points).
+
+    A ring must be:
+    - closed: first coord == last coord
+    - have at least 4 coordinate *pairs* (3 distinct vertices + closing repeat)
+
+    This is the minimum necessary check without a self-intersection test.
+    """
+    n = len(offsets0) - 1
+    for i in prange(n):
+        if not missing[i]:
+            start = offsets0[i]
+            stop  = offsets0[i + 1]
+            n_floats = stop - start
+            if n_floats < 8:           # < 4 coordinate pairs
+                result[i] = False
+            else:
+                result[i] = (values[start]     == values[stop - 2] and
+                             values[start + 1] == values[stop - 1])
+
+
+@ngpjit  # pragma: no cover
+def minimum_bounding_radius_map1(values, offsets0, result, missing):
+    """Approximate minimum bounding radius for each depth-1 geometry.
+
+    Returns half the diagonal of the bounding box, which is an upper bound
+    on the true minimum bounding circle radius.  Exact computation requires
+    Welzl's algorithm (O(n) expected) which is available via shapely; this
+    fast approximation is useful for quick spatial filtering.
+
+    result[i] = sqrt((xmax-xmin)^2 + (ymax-ymin)^2) / 2
+    """
+    n = len(offsets0) - 1
+    for i in prange(n):
+        if not missing[i]:
+            xmin, ymin, xmax, ymax = compute_bounds(
+                values, offsets0[i], offsets0[i + 1]
+            )
+            dx = xmax - xmin
+            dy = ymax - ymin
+            result[i] = sqrt(dx * dx + dy * dy) / 2.0
+
+
+@ngpjit  # pragma: no cover
+def minimum_bounding_radius_map2(values, offsets0, offsets1, result, missing):
+    """Approximate minimum bounding radius for each depth-2 (polygon) geometry."""
+    n = len(offsets0) - 1
+    for i in prange(n):
+        if not missing[i]:
+            start = offsets1[offsets0[i]]
+            stop  = offsets1[offsets0[i + 1]]
+            xmin, ymin, xmax, ymax = compute_bounds(values, start, stop)
+            dx = xmax - xmin
+            dy = ymax - ymin
+            result[i] = sqrt(dx * dx + dy * dy) / 2.0

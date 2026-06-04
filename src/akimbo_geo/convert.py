@@ -21,21 +21,12 @@ import numpy as np
 import pyarrow as pa
 import awkward as ak
 
+from akimbo_geo._compat import require_shapely, require_geopandas
+
 
 # ===========================================================================
 # Internal helpers
 # ===========================================================================
-
-def _require_shapely():
-    try:
-        import shapely
-        return shapely
-    except ImportError as exc:
-        raise ImportError(
-            "shapely>=2.0 is required for WKB/WKT conversion. "
-            "Install it with: pip install 'akimbo-geo[convert]'"
-        ) from exc
-
 
 def _shapely_to_arrow_list(geoms):
     """Convert a 1-D array of shapely geometries to a pa.Array of the
@@ -211,7 +202,7 @@ def from_wkb(arr: ak.Array) -> ak.Array:
 
     Requires ``shapely>=2.0``.
     """
-    shapely = _require_shapely()
+    shapely = require_shapely()
 
     # Convert to Python list of bytes objects for shapely
     py = ak.to_list(arr)
@@ -242,7 +233,7 @@ def to_wkb(arr: ak.Array) -> ak.Array:
 
     Requires ``shapely>=2.0``.
     """
-    shapely = _require_shapely()
+    shapely = require_shapely()
 
     geoms  = _arrow_list_to_shapely(arr)
     wkb    = np.array(
@@ -262,7 +253,7 @@ def from_wkt(arr: ak.Array) -> ak.Array:
 
     Requires ``shapely>=2.0``.
     """
-    shapely = _require_shapely()
+    shapely = require_shapely()
 
     py = ak.to_list(arr)
 
@@ -287,7 +278,7 @@ def to_wkt(arr: ak.Array) -> ak.Array:
 
     Requires ``shapely>=2.0``.
     """
-    shapely = _require_shapely()
+    shapely = require_shapely()
 
     geoms  = _arrow_list_to_shapely(arr)
     wkt    = np.array(
@@ -350,13 +341,8 @@ def to_spatialpandas(arr: ak.Array, geom_class=None):
     -------
     spatialpandas GeometryListArray subclass instance.
     """
-    try:
-        import spatialpandas.geometry as spg
-    except ImportError as exc:
-        raise ImportError(
-            "spatialpandas is required for to_spatialpandas. "
-            "Install it with: pip install 'akimbo-geo[spatialpandas]'"
-        ) from exc
+    from akimbo_geo._compat import require_spatialpandas
+    spg = require_spatialpandas().geometry
 
     # Use extensionarray=False to get a plain pa.Array that spatialpandas
     # can consume without the awkward extension type wrapper.
@@ -388,14 +374,8 @@ def from_geopandas(geoseries) -> ak.Array:
 
     Requires ``geopandas`` and ``shapely>=2.0``.
     """
-    _require_shapely()
-    try:
-        import geopandas  # noqa: F401
-    except ImportError as exc:
-        raise ImportError(
-            "geopandas is required. "
-            "Install it with: pip install 'akimbo-geo[geopandas]'"
-        ) from exc
+    require_shapely()
+    require_geopandas()
 
     geoms  = np.asarray(geoseries, dtype=object)
     pa_arr = _shapely_to_arrow_list(geoms)
@@ -407,15 +387,8 @@ def to_geopandas(arr: ak.Array):
 
     Requires ``geopandas`` and ``shapely>=2.0``.
     """
-    _require_shapely()
-    try:
-        import geopandas as gpd
-    except ImportError as exc:
-        raise ImportError(
-            "geopandas is required. "
-            "Install it with: pip install 'akimbo-geo[geopandas]'"
-        ) from exc
+    require_shapely()
+    gpd = require_geopandas()
 
-    pa_arr = ak.to_arrow(arr)
-    geoms  = _arrow_list_to_shapely(pa_arr)
+    geoms = _arrow_list_to_shapely(arr)
     return gpd.GeoSeries(geoms)

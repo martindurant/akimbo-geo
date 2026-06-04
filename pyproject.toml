@@ -27,9 +27,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-convert = ["shapely>=2.0"]
-geopandas = ["geopandas", "shapely>=2.0"]
+# shapely / convert are interchangeable names for the same optional dep
+shapely     = ["shapely>=2.0"]
+convert     = ["shapely>=2.0"]
+geopandas   = ["geopandas", "shapely>=2.0"]
 spatialpandas = ["spatialpandas"]
+# Install everything
+full = ["shapely>=2.0", "geopandas", "spatialpandas"]
 test = [
     "pytest",
     "pytest-cov",
