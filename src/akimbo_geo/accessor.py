@@ -307,10 +307,10 @@ def _op_bounds(layout):
         else:
             alg.bounds_map3(values, scaled[0], scaled[1], scaled[2], result, missing)
     return ak.contents.RecordArray(
-        [ak.contents.NumpyArray(result[:, 0]),
-         ak.contents.NumpyArray(result[:, 1]),
-         ak.contents.NumpyArray(result[:, 2]),
-         ak.contents.NumpyArray(result[:, 3])],
+        [ak.contents.NumpyArray(xp.ascontiguousarray(result[:, 0])),
+         ak.contents.NumpyArray(xp.ascontiguousarray(result[:, 1])),
+         ak.contents.NumpyArray(xp.ascontiguousarray(result[:, 2])),
+         ak.contents.NumpyArray(xp.ascontiguousarray(result[:, 3]))],
         ["xmin", "ymin", "xmax", "ymax"],
     )
 

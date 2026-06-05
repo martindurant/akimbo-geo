@@ -82,16 +82,28 @@ def _shapely_to_arrow_list(geoms):
         rows = [_mp_coords(g) for g in geoms]
         return pa.array(rows, type=pa.list_(pa.float64()))
 
-    elif isinstance(first, sg.Polygon):
-        # list<list<float64>>  [exterior, hole0, hole1, ...]
-        def _poly_coords(g):
+    elif isinstance(first, (sg.Polygon, sg.MultiPolygon)):
+        # list<list<float64>> — each element is one ring
+        # MultiPolygon is flattened: all rings from all sub-polygons concatenated.
+        # Exterior rings are stored first, then holes, preserving ring structure
+        # within each sub-polygon.  This is consistent with how spatialpandas
+        # stores MultiPolygon at depth-2 (all rings in one flat ring list).
+        def _poly_rings(g):
             if g is None:
                 return None
-            rings = [np.asarray(g.exterior.coords).ravel().tolist()]
-            for hole in g.interiors:
-                rings.append(np.asarray(hole.coords).ravel().tolist())
-            return rings
-        rows = [_poly_coords(g) for g in geoms]
+            if isinstance(g, sg.Polygon):
+                rings = [np.asarray(g.exterior.coords).ravel().tolist()]
+                for hole in g.interiors:
+                    rings.append(np.asarray(hole.coords).ravel().tolist())
+                return rings
+            else:  # MultiPolygon — flatten all rings
+                rings = []
+                for poly in g.geoms:
+                    rings.append(np.asarray(poly.exterior.coords).ravel().tolist())
+                    for hole in poly.interiors:
+                        rings.append(np.asarray(hole.coords).ravel().tolist())
+                return rings
+        rows = [_poly_rings(g) for g in geoms]
         return pa.array(rows, type=pa.list_(pa.list_(pa.float64())))
 
     elif isinstance(first, sg.MultiLineString):
@@ -102,21 +114,6 @@ def _shapely_to_arrow_list(geoms):
             return [np.asarray(line.coords).ravel().tolist() for line in g.geoms]
         rows = [_mls_coords(g) for g in geoms]
         return pa.array(rows, type=pa.list_(pa.list_(pa.float64())))
-
-    elif isinstance(first, sg.MultiPolygon):
-        # list<list<list<float64>>>
-        def _mpoly_coords(g):
-            if g is None:
-                return None
-            polys = []
-            for poly in g.geoms:
-                rings = [np.asarray(poly.exterior.coords).ravel().tolist()]
-                for hole in poly.interiors:
-                    rings.append(np.asarray(hole.coords).ravel().tolist())
-                polys.append(rings)
-            return polys
-        rows = [_mpoly_coords(g) for g in geoms]
-        return pa.array(rows, type=pa.list_(pa.list_(pa.list_(pa.float64()))))
 
     else:
         raise TypeError(
@@ -193,55 +190,89 @@ def _arrow_list_to_shapely(arr):
 # ===========================================================================
 
 def from_wkb(arr: ak.Array) -> ak.Array:
-    """Decode a column of WKB bytestrings into the canonical coordinate layout.
+    """Decode a flat column of WKB bytestrings into the canonical coordinate layout.
 
-    The input ``arr`` should contain WKB bytes (an ``ak.Array`` of
-    bytestrings, or a nested structure thereof).  The output has the same
-    outer structure but with each leaf WKB value replaced by the appropriate
-    nested list-of-float structure.
+    Uses ``shapely.from_wkb`` (vectorised C, no Python loops) to parse the
+    bytes, then ``shapely.to_ragged_array`` to extract the flat coordinate
+    buffers and offset arrays that akimbo-geo works on natively.
+
+    The column is assumed to be **homogeneous** — all rows contain the same
+    geometry type (or a promotable mix such as Polygon + MultiPolygon).
+    Shapely automatically promotes mixed types to the highest-dimensional
+    type (e.g. Polygon + MultiPolygon → MultiPolygon at depth-3).  The
+    GeoParquet ``geometry_types`` metadata field, if present, documents the
+    expected types.
+
+    Parameters
+    ----------
+    arr : ak.Array
+        1-D array of WKB bytestrings (``large_binary`` or ``binary`` Arrow
+        type).  Nulls are preserved as missing values in the output.
+
+    Returns
+    -------
+    ak.Array
+        Nested list-of-float geometry array in the canonical interleaved
+        coordinate format.  Depth depends on geometry type:
+        - Point       → depth-0  (bare float buffer)
+        - Line/Ring   → depth-1  list<float>
+        - Polygon     → depth-2  list<list<float>>
+        - MultiPolygon→ depth-3  list<list<list<float>>>
 
     Requires ``shapely>=2.0``.
     """
     shapely = require_shapely()
 
-    # Convert to Python list of bytes objects for shapely
-    py = ak.to_list(arr)
+    # shapely.from_wkb is fully vectorised (C extension, GIL released).
+    # We pass a numpy object array of bytes objects — no Python iteration.
+    wkb_np = np.array(ak.to_list(arr), dtype=object)
+    geoms   = shapely.from_wkb(wkb_np)
 
-    def _decode(item):
-        if item is None:
-            return None
-        if isinstance(item, (bytes, bytearray)):
-            g = shapely.from_wkb(item)
-            pa_arr = _shapely_to_arrow_list(np.array([g], dtype=object))
-            return pa_arr.to_pylist()[0]
-        if isinstance(item, list):
-            return [_decode(x) for x in item]
-        raise TypeError(f"Expected bytes, got {type(item)}")
+    # Guard: if all geometries are null, to_ragged_array raises.
+    # Return a flat null float array in that case.
+    non_null = geoms[geoms != None]  # noqa: E711
+    if len(non_null) == 0:
+        return ak.from_arrow(pa.array([None] * len(geoms), type=pa.list_(pa.float64())))
 
-    decoded = [_decode(x) for x in py]
-    # Rebuild as an awkward array via pyarrow
-    # Infer the arrow type from the first non-null decoded entry.
-    first = next((x for x in decoded if x is not None), None)
-    if first is None:
-        return ak.from_arrow(pa.array(decoded, type=pa.list_(pa.float64())))
-    pa_arr = pa.array(decoded)
-    return ak.from_arrow(pa_arr)
+    # to_ragged_array extracts coords + offset arrays at the C level.
+    geom_type_id, coords, pt_offsets = shapely.to_ragged_array(geoms)
+
+    # coords is (N_pts, n_dims) float64 — ravel to interleaved flat buffer
+    values    = np.ascontiguousarray(coords).ravel().astype(np.float64)
+    n_dims    = coords.shape[1] if coords.ndim == 2 and len(coords) > 0 else 2
+    list_depth = len(pt_offsets)   # 0=Point, 1=Line, 2=Polygon, 3=MultiPolygon
+
+    # pt_offsets from to_ragged_array are in *innermost-first* (shapely) order.
+    # _rebuild_depth expects *outermost-first* float-unit offsets.
+    # Reverse the tuple and scale the first element (innermost ring→point) to
+    # float units — identical to the logic in _shapely_to_layout().
+    from akimbo_geo.accessor import _rebuild_depth, GeoLayout, CoordKind
+    if list_depth == 0:
+        float_offsets = ()
+    elif list_depth == 1:
+        float_offsets = (pt_offsets[0] * n_dims,)
+    else:
+        reversed_offsets = tuple(reversed(pt_offsets))
+        float_offsets = reversed_offsets[:-1] + (reversed_offsets[-1] * n_dims,)
+
+    new_geo = GeoLayout(CoordKind.INTERLEAVED_FLAT, n_dims, list_depth)
+    layout  = _rebuild_depth(values, float_offsets, new_geo)
+    return ak.Array(layout)
 
 
 def to_wkb(arr: ak.Array) -> ak.Array:
     """Encode canonical coordinate layout → WKB bytestrings.
 
+    Uses ``shapely.to_wkb`` (vectorised C).  The input must be a flat
+    (1-D) geometry array.
+
     Requires ``shapely>=2.0``.
     """
     shapely = require_shapely()
-
-    geoms  = _arrow_list_to_shapely(arr)
-    wkb    = np.array(
-        [shapely.to_wkb(g) if g is not None else None for g in geoms],
-        dtype=object,
-    )
-    pa_out = pa.array(wkb.tolist(), type=pa.large_binary())
-    return ak.from_arrow(pa_out)
+    from akimbo_geo.accessor import _layout_to_shapely
+    geoms  = _layout_to_shapely(arr.layout)
+    wkb_np = shapely.to_wkb(geoms)
+    return ak.from_arrow(pa.array(wkb_np.tolist(), type=pa.large_binary()))
 
 
 # ===========================================================================
@@ -249,28 +280,40 @@ def to_wkb(arr: ak.Array) -> ak.Array:
 # ===========================================================================
 
 def from_wkt(arr: ak.Array) -> ak.Array:
-    """Decode a column of WKT strings into the canonical coordinate layout.
+    """Decode a flat column of WKT strings into the canonical coordinate layout.
+
+    Uses ``shapely.from_wkt`` (vectorised C) then ``to_ragged_array``, with
+    the same homogeneity assumption as :func:`from_wkb`.
 
     Requires ``shapely>=2.0``.
     """
     shapely = require_shapely()
 
-    py = ak.to_list(arr)
+    wkt_np = np.array(ak.to_list(arr), dtype=object)
+    geoms   = shapely.from_wkt(wkt_np)
 
-    def _decode(item):
-        if item is None:
-            return None
-        if isinstance(item, str):
-            g = shapely.from_wkt(item)
-            pa_arr = _shapely_to_arrow_list(np.array([g], dtype=object))
-            return pa_arr.to_pylist()[0]
-        if isinstance(item, list):
-            return [_decode(x) for x in item]
-        raise TypeError(f"Expected str, got {type(item)}")
+    non_null = geoms[geoms != None]  # noqa: E711
+    if len(non_null) == 0:
+        return ak.from_arrow(pa.array([None] * len(geoms), type=pa.list_(pa.float64())))
 
-    decoded = [_decode(x) for x in py]
-    pa_arr  = pa.array(decoded)
-    return ak.from_arrow(pa_arr)
+    geom_type_id, coords, pt_offsets = shapely.to_ragged_array(geoms)
+
+    values    = np.ascontiguousarray(coords).ravel().astype(np.float64)
+    n_dims    = coords.shape[1] if coords.ndim == 2 and len(coords) > 0 else 2
+    list_depth = len(pt_offsets)
+
+    from akimbo_geo.accessor import _rebuild_depth, GeoLayout, CoordKind
+    if list_depth == 0:
+        float_offsets = ()
+    elif list_depth == 1:
+        float_offsets = (pt_offsets[0] * n_dims,)
+    else:
+        reversed_offsets = tuple(reversed(pt_offsets))
+        float_offsets = reversed_offsets[:-1] + (reversed_offsets[-1] * n_dims,)
+
+    new_geo = GeoLayout(CoordKind.INTERLEAVED_FLAT, n_dims, list_depth)
+    layout  = _rebuild_depth(values, float_offsets, new_geo)
+    return ak.Array(layout)
 
 
 def to_wkt(arr: ak.Array) -> ak.Array:
@@ -392,3 +435,130 @@ def to_geopandas(arr: ak.Array):
 
     geoms = _arrow_list_to_shapely(arr)
     return gpd.GeoSeries(geoms)
+
+
+# ===========================================================================
+# Parquet I/O — geometry-aware loading
+# ===========================================================================
+
+def read_parquet(
+    path: str,
+    geometry_col: str = "geometry",
+    columns=None,
+    **kwargs,
+) -> "pd.DataFrame":
+    """Read a (Geo)Parquet file into a plain pandas DataFrame.
+
+    Handles both encoding conventions automatically:
+
+    **Native geoarrow** (``encoding`` in ``["geoarrow.point", "geoarrow.linestring",
+    "geoarrow.polygon", "geoarrow.multipolygon", ...]``):
+        The geometry column is already stored as nested list-of-float arrays.
+        It is loaded as a ``pd.ArrowDtype`` column and returned as-is — no
+        conversion, no shapely, zero overhead.
+
+    **WKB** (``encoding == "WKB"`` or no ``geo`` metadata):
+        The geometry column is decoded from WKB bytestrings using
+        ``shapely.from_wkb`` + ``shapely.to_ragged_array`` (both vectorised
+        C calls) and stored as a ``pd.ArrowDtype`` column of interleaved
+        coordinate arrays.  Shapely handles mixed geometry types (e.g.
+        Polygon + MultiPolygon) by promoting to the highest type.
+
+    Parameters
+    ----------
+    path : str
+        Path to a Parquet file.
+    geometry_col : str, default ``"geometry"``
+        Name of the geometry column in the file.
+    columns : list[str] | None
+        Columns to read; if None, all columns are read.
+    **kwargs
+        Passed through to ``pyarrow.parquet.read_table``.
+
+    Returns
+    -------
+    pd.DataFrame
+        A plain pandas DataFrame with ``pd.ArrowDtype`` columns.  The
+        geometry column contains akimbo-geo's native interleaved coordinate
+        format and supports ``.ak.geo`` directly — no further conversion
+        step is needed.
+
+    Examples
+    --------
+    >>> import akimbo.pandas, akimbo_geo
+    >>> from akimbo_geo.convert import read_parquet
+    >>>
+    >>> # Works for native geoarrow AND WKB parquet files:
+    >>> df = read_parquet("buildings.parquet")
+    >>> df["area"] = df["geometry"].ak.geo.area()
+    """
+    import json
+    import pyarrow.parquet as pq
+    import pandas as pd
+
+    pf = pq.ParquetFile(path)
+    schema = pf.schema_arrow
+
+    # Read all requested columns
+    if columns is not None and geometry_col not in columns:
+        columns = list(columns) + [geometry_col]
+    table = pq.read_table(path, columns=columns, **kwargs)
+
+    # Detect geometry encoding from GeoParquet metadata
+    raw_meta = schema.metadata or {}
+    geo_meta = raw_meta.get(b"geo")
+    encoding = None
+    if geo_meta:
+        try:
+            geo = json.loads(geo_meta)
+            col_info = geo.get("columns", {}).get(geometry_col, {})
+            encoding = col_info.get("encoding", "WKB")
+        except (json.JSONDecodeError, AttributeError):
+            encoding = "WKB"
+
+    geom_col = table.column(geometry_col)
+
+    if encoding and encoding.lower() != "wkb":
+        # Native geoarrow: column is already list-of-float arrays.
+        # Just wrap as ArrowDtype — zero conversion.
+        geom_series = pd.array(geom_col, dtype=pd.ArrowDtype(geom_col.type))
+    else:
+        # WKB: decode via shapely (vectorised C) → flat coord arrays
+        require_shapely()
+        import shapely as _shapely
+        from akimbo_geo.accessor import _rebuild_depth, GeoLayout, CoordKind
+
+        wkb_np    = np.array([x.as_py() for x in geom_col], dtype=object)
+        geoms     = _shapely.from_wkb(wkb_np)
+        _, coords, pt_offsets = _shapely.to_ragged_array(geoms)
+
+        values     = np.ascontiguousarray(coords).ravel().astype(np.float64)
+        n_dims     = coords.shape[1] if coords.ndim == 2 and len(coords) > 0 else 2
+        list_depth = len(pt_offsets)
+
+        if list_depth == 0:
+            float_offsets = ()
+        elif list_depth == 1:
+            float_offsets = (pt_offsets[0] * n_dims,)
+        else:
+            rev = tuple(reversed(pt_offsets))
+            float_offsets = rev[:-1] + (rev[-1] * n_dims,)
+
+        new_geo = GeoLayout(CoordKind.INTERLEAVED_FLAT, n_dims, list_depth)
+        layout  = _rebuild_depth(values, float_offsets, new_geo)
+        geom_ak = ak.Array(layout)
+        geom_pa = ak.to_arrow(geom_ak, extensionarray=False)
+        geom_series = pd.array(geom_pa, dtype=pd.ArrowDtype(geom_pa.type))
+
+    # Build the output DataFrame with ArrowDtype columns
+    other_cols = [c for c in table.column_names if c != geometry_col]
+    df = table.select(other_cols).to_pandas(
+        types_mapper=pd.ArrowDtype,
+    )
+    df[geometry_col] = geom_series
+    # Move geometry column to position it had in the original table
+    orig_pos = table.column_names.index(geometry_col)
+    cols = list(df.columns)
+    cols.remove(geometry_col)
+    cols.insert(orig_pos, geometry_col)
+    return df[cols]

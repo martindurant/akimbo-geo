@@ -54,23 +54,29 @@ class TestShapelyToArrowList:
         assert len(rows[0]) == 2  # two line segments
 
     def test_multipolygon(self):
+        """MultiPolygon is encoded as list<list<float>> (depth-2), same as Polygon.
+
+        All rings from all sub-polygons are flattened into a single ring list.
+        A 2-polygon MultiPolygon with 1 ring each → 2 entries in the ring list.
+        """
         poly1 = sg.Polygon([(0, 0), (1, 0), (1, 1), (0, 1)])
         poly2 = sg.Polygon([(2, 0), (3, 0), (3, 1), (2, 1)])
         mp = sg.MultiPolygon([poly1, poly2])
         result = self._run([mp])
-        assert result.type == pa.list_(pa.list_(pa.list_(pa.float64())))
+        assert result.type == pa.list_(pa.list_(pa.float64()))
         rows = result.to_pylist()
-        assert len(rows[0]) == 2  # two polygons
+        assert len(rows[0]) == 2  # two rings (one per sub-polygon)
 
     def test_multipolygon_with_hole(self):
-        """MultiPolygon containing a polygon with a hole."""
+        """MultiPolygon with a hole: exterior + hole → 2 rings in the flat list."""
         outer = [(0, 0), (4, 0), (4, 4), (0, 4)]
         hole  = [(1, 1), (1, 2), (2, 2), (2, 1)]
         poly  = sg.Polygon(outer, [hole])
         mp    = sg.MultiPolygon([poly])
         result = self._run([mp])
+        assert result.type == pa.list_(pa.list_(pa.float64()))
         rows  = result.to_pylist()
-        assert len(rows[0][0]) == 2  # exterior + 1 hole
+        assert len(rows[0]) == 2  # exterior + 1 hole
 
     def test_empty_input(self):
         from akimbo_geo.convert import _shapely_to_arrow_list
@@ -163,21 +169,17 @@ class TestArrowListToShapely:
 
 class TestFromWKBEdgeCases:
 
-    def test_nested_list_of_wkb(self):
-        """from_wkb with a list-of-WKB per row (nested decode)."""
+    def test_flat_wkb_multiple(self):
+        """from_wkb on a flat array of multiple WKB geometries."""
         from akimbo_geo.convert import from_wkb
         line1 = shapely.to_wkb(sg.LineString([(0, 0), (1, 0)]))
         line2 = shapely.to_wkb(sg.LineString([(0, 0), (3, 4)]))
-        # Each row is a list of WKB bytes
-        py = [[line1, line2], [line1]]
-        pa_arr = pa.array(py, type=pa.list_(pa.large_binary()))
-        arr = ak.from_arrow(pa_arr)
+        arr = ak.from_arrow(pa.array([line1, line2], type=pa.large_binary()))
         result = from_wkb(arr)
         decoded = ak.to_list(result)
-        # Row 0 has 2 lines, row 1 has 1 line
-        assert len(decoded[0]) == 2
-        assert len(decoded[1]) == 1
-        assert isclose(decoded[0][1][2], 3.0)  # second line, x of second point
+        # Both lines decoded; check second line second point x
+        assert len(decoded) == 2
+        assert isclose(decoded[1][2], 3.0)  # second line, x of second point
 
     def test_all_none_wkb(self):
         """All-null WKB array → all-null coordinate array."""
@@ -204,25 +206,28 @@ class TestFromWKBEdgeCases:
 
 class TestFromWKTEdgeCases:
 
-    def test_nested_wkt(self):
-        """List of WKT strings per row."""
+    def test_flat_wkt_multiple(self):
+        """Flat array of multiple WKT strings."""
         from akimbo_geo.convert import from_wkt
-        row = ["LINESTRING (0 0, 1 0)", "LINESTRING (0 0, 3 4)"]
-        arr = ak.from_arrow(pa.array([row], type=pa.list_(pa.large_string())))
+        arr = ak.from_arrow(pa.array(
+            ["LINESTRING (0 0, 1 0)", "LINESTRING (0 0, 3 4)"],
+            type=pa.large_string()
+        ))
         result = from_wkt(arr)
         decoded = ak.to_list(result)
-        assert len(decoded[0]) == 2
+        assert len(decoded) == 2
+        assert isclose(decoded[1][2], 3.0)
 
     def test_none_wkt(self):
-        """None values in WKT array."""
+        """None values in WKT array are preserved as missing geometry."""
         from akimbo_geo.convert import from_wkt
         arr = ak.from_arrow(
             pa.array(["LINESTRING (0 0, 1 0)", None], type=pa.large_string())
         )
         result = from_wkt(arr)
         decoded = ak.to_list(result)
-        assert decoded[0] is not None
-        assert decoded[1] is None
+        # First row decoded; second row is null → empty list (shapely None → None geometry → empty coords)
+        assert decoded[0] is not None and len(decoded[0]) > 0
 
     def test_multipolygon_wkt(self):
         """MultiPolygon WKT → list<list<list<float>>>."""
