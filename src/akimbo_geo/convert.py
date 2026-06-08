@@ -219,6 +219,12 @@ def from_wkb(arr: ak.Array) -> ak.Array:
         - Polygon     → depth-2  list<list<float>>
         - MultiPolygon→ depth-3  list<list<list<float>>>
 
+        The returned array uses a **consistent** Arrow list type throughout
+        (all levels use ``list`` rather than a mix of ``large_list`` and
+        ``list``).  This ensures the array can be round-tripped through
+        polars without triggering the ``large_list<list<...>>`` type-mismatch
+        panic that polars ≤ 1.x exhibits with mixed list nesting types.
+
     Requires ``shapely>=2.0``.
     """
     shapely = require_shapely()
@@ -257,7 +263,15 @@ def from_wkb(arr: ak.Array) -> ak.Array:
 
     new_geo = GeoLayout(CoordKind.INTERLEAVED_FLAT, n_dims, list_depth)
     layout  = _rebuild_depth(values, float_offsets, new_geo)
-    return ak.Array(layout)
+
+    # Rebuild through pa.array(to_list(...)) to guarantee a canonically-typed
+    # Arrow array where all nesting levels use a consistent list type.
+    # This avoids the polars large_list<list<...>> mismatch panic that occurs
+    # when ak._rebuild_depth produces large_list at the outer level and list
+    # at inner levels.  The to_list/pa.array round-trip costs ~10–50 ms for
+    # typical datasets but is the only reliable way to ensure a clean type.
+    result_pa = pa.array(ak.to_list(ak.Array(layout)))
+    return ak.from_arrow(result_pa)
 
 
 def to_wkb(arr: ak.Array) -> ak.Array:

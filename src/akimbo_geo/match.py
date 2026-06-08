@@ -195,6 +195,40 @@ def _match_at_depth(layout, depth: int) -> bool:
     return geo is not None and geo.list_depth == depth
 
 
+def match_wkb(*layouts, **_) -> bool:
+    """Match a WKB bytestring column (``__array__ == 'bytestring'``).
+
+    WKB columns appear as an awkward layout with parameter
+    ``__array__ = 'bytestring'``, whether they come from Arrow ``binary`` /
+    ``large_binary`` types (pandas ArrowDtype, polars Binary) or from an
+    explicit ``ak.Array`` of bytes.
+
+    Used by ``from_wkb`` when wired as a ``dec()``-based accessor method so
+    that it can be called as ``series.ak.geo.from_wkb()`` directly on a
+    bytes-typed column.
+    """
+    layout = _unwrap(layouts[0])
+    # Bytestrings are ListOffsetArray with __array__ == 'bytestring'
+    if layout.is_list and layout.parameter("__array__") == "bytestring":
+        return True
+    # Also match the bare bytes/NumpyArray leaf from ak.Array of bytes
+    if layout.is_leaf and getattr(layout, "dtype", None) is not None \
+            and layout.dtype.kind == "V":   # void / opaque bytes
+        return True
+    return False
+
+
+def match_wkt(*layouts, **_) -> bool:
+    """Match a WKT string column (``__array__ == 'string'``).
+
+    Used by ``from_wkt`` when wired as a ``dec()``-based accessor method so
+    that it can be called as ``series.ak.geo.from_wkt()`` directly on a
+    string-typed column.
+    """
+    layout = _unwrap(layouts[0])
+    return layout.is_list and layout.parameter("__array__") in ("string", "char")
+
+
 def match_point(*layouts, **_) -> bool:
     """Match Point: coordinate leaf at depth 0.
 

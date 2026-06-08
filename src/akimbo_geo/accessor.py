@@ -56,6 +56,8 @@ from akimbo_geo.match import (
     match_multipolygon,
     match_point,
     match_polygon,
+    match_wkb,
+    match_wkt,
 )
 
 
@@ -843,6 +845,34 @@ def _shapely_to_layout(geoms, reference_geo: GeoLayout | None = None):
 
 
 # ===========================================================================
+# Op functions — WKB / WKT decode (dec()-based, match_wkb / match_wkt)
+# ===========================================================================
+
+def _op_from_wkb(layout):
+    """Decode a matched bytestring layout node into a geometry layout.
+
+    Called by ``dec()`` for each ``bytestring``-typed node it encounters.
+    Receives the raw bytestring layout and returns the decoded coordinate
+    layout (same outer structure, geometry leaf replaced by flat floats).
+    """
+    require_shapely()
+    from akimbo_geo.convert import from_wkb as _from_wkb
+    result = _from_wkb(ak.Array(layout))
+    return result.layout
+
+
+def _op_from_wkt(layout):
+    """Decode a matched string layout node into a geometry layout.
+
+    Called by ``dec()`` for each ``string``-typed node it encounters.
+    """
+    require_shapely()
+    from akimbo_geo.convert import from_wkt as _from_wkt
+    result = _from_wkt(ak.Array(layout))
+    return result.layout
+
+
+# ===========================================================================
 # Op functions — Tier 2 unary scalar (shapely-backed)
 # ===========================================================================
 
@@ -1593,12 +1623,23 @@ class GeoAccessor:
 
     @staticmethod
     def from_wkb(arr):
-        """Decode WKB bytestring column → canonical coordinate layout.
+        """Decode a WKB bytestring column into the canonical coordinate layout.
+
+        Can be called directly on a bytes-typed Series — the ``dec()``
+        tree-walker matches any ``bytestring``-typed layout node and calls
+        ``shapely.from_wkb`` + ``to_ragged_array`` (both vectorised C, no
+        Python loops) to decode it into flat interleaved coordinate arrays.
+
+        Examples
+        --------
+        >>> # pandas
+        >>> df["geometry"] = df["wkb_col"].ak.geo.from_wkb()
+        >>> # polars
+        >>> df = df.with_columns(df["wkb_col"].ak.geo.from_wkb().alias("geometry"))
 
         Requires ``shapely>=2.0``.
         """
-        from akimbo_geo.convert import from_wkb as _from_wkb
-        return _from_wkb(arr)
+        return dec(_op_from_wkb, match=match_wkb, inmode="ak")(arr)
 
     @staticmethod
     def to_wkb(arr):
@@ -1611,12 +1652,19 @@ class GeoAccessor:
 
     @staticmethod
     def from_wkt(arr):
-        """Decode WKT string column → canonical coordinate layout.
+        """Decode a WKT string column into the canonical coordinate layout.
+
+        Can be called directly on a string-typed Series — the ``dec()``
+        tree-walker matches any ``string``-typed layout node and calls
+        ``shapely.from_wkt`` + ``to_ragged_array`` (both vectorised C).
+
+        Examples
+        --------
+        >>> df["geometry"] = df["wkt_col"].ak.geo.from_wkt()
 
         Requires ``shapely>=2.0``.
         """
-        from akimbo_geo.convert import from_wkt as _from_wkt
-        return _from_wkt(arr)
+        return dec(_op_from_wkt, match=match_wkt, inmode="ak")(arr)
 
     @staticmethod
     def to_wkt(arr):
