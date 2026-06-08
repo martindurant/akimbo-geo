@@ -113,7 +113,7 @@ df[["fire_name", "fire_type", "year", "acres", "n_patches"]].nlargest(8, "n_patc
 
 # %%
 bbox = df["geometry"].ak.geo.bounds()
-df[["xmin", "ymin", "xmax", "ymax"]] = pd.DataFrame(bbox.tolist())
+df[["xmin", "ymin", "xmax", "ymax"]] = bbox.ak.unpack()
 
 # Isoperimetric compactness: 4π·Area / Perimeter²
 # Use degree² area and degree perimeter (consistent units)
@@ -244,10 +244,11 @@ acres_val = gdf.loc[idx, 'acres']
 print(f"  Acres:        {acres_val if isinstance(acres_val, list) else list(acres_val)}")
 
 # %%
-# Max perimeter area per fire (largest single event)
-gdf["max_event_area"] = event_areas.ak.max(axis=1)
-# Sum of perimeter areas per fire (cumulative burn footprint)
-gdf["sum_event_area"] = event_areas.ak.sum(axis=1)
+# Max and sum of perimeter areas per fire (cumulative burn footprint).
+# event_areas values are signed (negative for CW rings); apply abs first.
+abs_event_areas = event_areas.ak.transform(abs)
+gdf["max_event_area"] = abs_event_areas.ak.max(axis=1)
+gdf["sum_event_area"] = abs_event_areas.ak.sum(axis=1)
 
 print("Total cumulative area (sum of all events) — top fires:")
 gdf[["fire_name", "n_events", "year_min", "year_max", "total_acres", "sum_event_area"]].nlargest(
@@ -268,8 +269,7 @@ print("  = struct per fire name — aggregate bbox across all events in its hist
 print(f"  len={len(event_bounds)} rows (one per fire name)")
 
 # Unpack the aggregate bounding boxes
-total_bbox = pd.DataFrame(event_bounds.tolist())
-gdf[["hist_xmin", "hist_ymin", "hist_xmax", "hist_ymax"]] = total_bbox
+gdf[["hist_xmin", "hist_ymin", "hist_xmax", "hist_ymax"]] = event_bounds.ak.unpack()
 gdf["hist_width_deg"]  = gdf["hist_xmax"] - gdf["hist_xmin"]
 gdf["hist_height_deg"] = gdf["hist_ymax"] - gdf["hist_ymin"]
 

@@ -43,8 +43,6 @@
 
 # %%
 import numpy as np
-import pandas as pd
-import awkward as ak          # only for ak.num(); no direct geometry work
 import akimbo.pandas          # registers .ak accessor
 import akimbo_geo             # registers .ak.geo sub-accessor
 from akimbo_geo.convert import read_parquet
@@ -72,7 +70,7 @@ df[["NAME", "STATEFP", "ALAND_km2", "INTPTLAT", "INTPTLON"]].head(3)
 # %%
 bbox = df["geometry"].ak.geo.bounds()
 print("bounds() return dtype:", bbox.dtype)
-df[["xmin", "ymin", "xmax", "ymax"]] = pd.DataFrame(bbox.tolist())
+df[["xmin", "ymin", "xmax", "ymax"]] = bbox.ak.unpack()
 
 df["width_deg"]  = df["xmax"] - df["xmin"]
 df["height_deg"] = df["ymax"] - df["ymin"]
@@ -82,9 +80,6 @@ df[["NAME", "NAMELSAD", "STATEFP", "width_deg"]].nlargest(8, "width_deg")
 
 # %% [markdown]
 # ## Bounding-box centroid  (pure arithmetic)
-#
-# A fast centroid approximation: midpoint of the bounding box.
-# Compared against the Census interior-point coordinate.
 
 # %%
 df["cx"] = (df["xmin"] + df["xmax"]) / 2
@@ -96,9 +91,6 @@ print(f"Median bbox-centroid vs Census interior-point: {lat_diff.median():.4f} d
 
 # %% [markdown]
 # ## Area and perimeter  (pure numba, depth-3)
-#
-# `.ak.geo.area3()` applies the shoelace formula at MultiPolygon depth.
-# `.ak.geo.length3()` computes total ring-perimeter length.
 
 # %%
 df["area_deg2"]     = df["geometry"].ak.geo.area3().abs()
@@ -113,8 +105,6 @@ print(f"log-log correlation (shoelace deg2 vs ALAND km2): {corr:.4f}")
 
 # %% [markdown]
 # ## Shape compactness  (pure numba)
-#
-# Isoperimetric ratio `4*pi*Area / Perimeter**2`.
 
 # %%
 df["compactness"] = 4 * np.pi * df["area_deg2"] / df["perimeter_deg"] ** 2
@@ -133,8 +123,7 @@ df[["NAME", "NAMELSAD", "STATEFP", "compactness"]].nsmallest(8, "compactness")
 # Counties with `n_polygons > 1` are discontiguous (islands, exclaves, etc).
 
 # %%
-geom_ak = ak.from_arrow(df["geometry"].ak.arrow)
-df["n_polygons"] = ak.num(geom_ak, axis=1).tolist()
+df["n_polygons"] = df["geometry"].ak.num(axis=1)
 
 print("Polygon count distribution:")
 print(df["n_polygons"].value_counts().sort_index().head(10))
@@ -157,8 +146,8 @@ df[["NAME", "NAMELSAD", "STATEFP", "mbr_deg", "ALAND_km2"]].nlargest(8, "mbr_deg
 # %%
 geom_shifted = df["geometry"].ak.geo.translate(xoff=0.0, yoff=1.0)
 
-bbox_shifted = pd.DataFrame(geom_shifted.ak.geo.bounds().tolist())
-cy_shifted   = (bbox_shifted["ymin"] + bbox_shifted["ymax"]) / 2
+shifted_bounds = geom_shifted.ak.geo.bounds()
+cy_shifted = (shifted_bounds.ak["ymin"] + shifted_bounds.ak["ymax"]) / 2
 delta = cy_shifted - df["cy"]
 print(f"Mean northward shift: {delta.mean():.6f} deg  (expected 1.0)")
 print(f"Std:                  {delta.std():.2e}")

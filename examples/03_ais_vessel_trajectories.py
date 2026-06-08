@@ -112,7 +112,7 @@ df[["MMSI", "VesselName", "VesselType", "n_pings", "track_length_km", "sog_max"]
 
 # %%
 bbox = df["waypoints"].ak.geo.bounds()
-df[["xmin", "ymin", "xmax", "ymax"]] = pd.DataFrame(bbox.tolist())
+df[["xmin", "ymin", "xmax", "ymax"]] = bbox.ak.unpack()
 
 df["bbox_width_deg"]  = df["xmax"] - df["xmin"]
 df["bbox_height_deg"] = df["ymax"] - df["ymin"]
@@ -133,42 +133,31 @@ df[["MMSI", "VesselName", "VesselType", "n_pings", "bbox_area_deg2"]].nlargest(8
 # midpoint of their journey; for moored vessels it approximates their berth.
 
 # %%
-centroids = pd.DataFrame(df["waypoints"].ak.geo.centroid().tolist()).rename(
-    columns={"x": "centroid_lon", "y": "centroid_lat"}
-)
-df[["centroid_lon", "centroid_lat"]] = centroids
+centroid_result = df["waypoints"].ak.geo.centroid()
+df["centroid_lon"] = centroid_result.ak["x"]
+df["centroid_lat"] = centroid_result.ak["y"]
 
 # How far is the centroid from the bbox midpoint?
 bbox_mid_lon = (df["xmin"] + df["xmax"]) / 2
 bbox_mid_lat = (df["ymin"] + df["ymax"]) / 2
 displacement = np.sqrt(
-    (centroids["centroid_lon"] - bbox_mid_lon) ** 2
-    + (centroids["centroid_lat"] - bbox_mid_lat) ** 2
+    (df["centroid_lon"] - bbox_mid_lon) ** 2
+    + (df["centroid_lat"] - bbox_mid_lat) ** 2
 )
 print(f"Median centroid vs bbox-midpoint displacement: {displacement.median():.5f} deg")
 
 # %% [markdown]
 # ## Coordinate count vs. `n_pings`  (pure numba — demonstrates depth-1)
-#
-# `.ak.geo.count_coordinates()` counts the number of coordinate *pairs*
-# in each geometry.  For depth-1 (list of points), this is exactly the number
-# of waypoints — the same as `n_pings`.
 
 # %%
 n_coords = df["waypoints"].ak.geo.count_coordinates()
-# Compare as plain numpy arrays to avoid ArrowDtype issues
-match = np.array(n_coords.tolist()) == np.array(df["n_pings"].tolist())
-print(f"count_coordinates() == n_pings: {bool(match.all())} ({int(match.sum()):,} / {len(df):,})")
+match = (n_coords == df["n_pings"])
+print(f"count_coordinates() == n_pings: {bool(match.all())} ({int(match.sum()):,} / {len(df):,}")
 
 # %% [markdown]
 # ## Spatial filter: vessels in the Gulf of Mexico  (pure numba — bounds)
-#
-# Extract vessels whose track intersects the Gulf of Mexico bounding box.
-# The `intersects_bounds` kernel checks each track's individual segments
-# against the query box.
 
 # %%
-# Gulf of Mexico approximate bounding box
 gulf = {"x0": -97.0, "y0": 18.0, "x1": -80.0, "y1": 30.5}
 
 in_gulf = df["waypoints"].ak.geo.intersects_bounds(
@@ -205,13 +194,13 @@ t1 = time.perf_counter()
 print(f"simplify(0.05 deg) on {len(active):,} vessels: {(t1-t0)*1000:.0f} ms")
 
 orig_pts = int(active["n_pings"].sum())
-simp_pts = int(np.sum(np.array(simplified.ak.geo.count_coordinates().tolist())))
+simp_pts = int(simplified.ak.geo.count_coordinates().sum())
 print(f"Waypoints: {orig_pts:,} → {simp_pts:,} ({(1-simp_pts/orig_pts)*100:.1f}% reduction)")
 
 # Simplified track lengths — should be close to originals for small tolerance
 simp_len_km = simplified.ak.geo.length() * 111.0
-orig_len = np.array(active["track_length_km"].tolist(), dtype=float).clip(0.001)
-simp_arr = np.array(simp_len_km.tolist(), dtype=float)
+orig_len = active["track_length_km"].to_numpy(dtype=float, na_value=0.001).clip(0.001)
+simp_arr = simp_len_km.to_numpy(dtype=float, na_value=0.0)
 len_diff_pct = np.abs((simp_arr - orig_len) / orig_len).clip(0, 1) * 100
 print(f"Median track length change after simplification: {np.median(len_diff_pct):.2f}%")
 

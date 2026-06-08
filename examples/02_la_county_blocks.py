@@ -75,10 +75,8 @@ bbox = df["geometry"].ak.geo.bounds()
 t1 = time.perf_counter()
 print(f"bounds() on {len(df):,} polygons: {(t1-t0)*1000:.0f} ms")
 
-df[["xmin", "ymin", "xmax", "ymax"]] = pd.DataFrame(bbox.tolist())
-
-bdf = pd.DataFrame(bbox.tolist())
-print(bdf.describe().round(4))
+df[["xmin", "ymin", "xmax", "ymax"]] = bbox.ak.unpack()
+print(bbox.ak.unpack().describe().round(4))
 
 # %% [markdown]
 # ## Area  (pure numba, depth-3)
@@ -174,8 +172,8 @@ t0 = time.perf_counter()
 df["is_ccw"] = df["geometry"].ak.geo.is_ccw()
 t1 = time.perf_counter()
 print(f"is_ccw() on {len(df):,} polygons: {(t1-t0)*1000:.0f} ms")
-# is_ccw returns list<bool> for depth-3; flatten before counting
-n_ccw = int(ak.sum(ak.ravel(ak.from_arrow(df["is_ccw"].ak.arrow))))
+# is_ccw returns list<bool> for depth-3; sum after flattening with .ak.ravel().ak.sum()
+n_ccw = int(df["is_ccw"].ak.ravel().ak.sum())
 print(f"CCW exteriors: {n_ccw:,} / {len(df):,}")
 
 # %%
@@ -186,7 +184,7 @@ print(f"orient_polygons() on {len(df):,} polygons: {(t1-t0)*1000:.0f} ms")
 
 df["geom_ccw"] = geom_oriented
 ccw_after = df["geom_ccw"].ak.geo.is_ccw()
-n_ccw_after = int(ak.sum(ak.ravel(ak.from_arrow(ccw_after.ak.arrow))))
+n_ccw_after = int(ccw_after.ak.ravel().ak.sum())
 print(f"CCW after orient_polygons: {n_ccw_after:,} / {len(df):,}")
 
 # %% [markdown]
@@ -198,8 +196,8 @@ geom_shifted = df["geometry"].ak.geo.translate(xoff=0.0, yoff=0.1)
 t1 = time.perf_counter()
 print(f"translate() on {len(df):,} polygons: {(t1-t0)*1000:.0f} ms")
 
-bbox_shifted = pd.DataFrame(geom_shifted.ak.geo.bounds().tolist())
-cy_shifted   = (bbox_shifted["ymin"] + bbox_shifted["ymax"]) / 2
+bbox_shifted = geom_shifted.ak.geo.bounds()
+cy_shifted   = (bbox_shifted.ak["ymin"] + bbox_shifted.ak["ymax"]) / 2
 delta = cy_shifted - df["cy"]
 print(f"Mean northward shift: {delta.mean():.6f} deg (expected 0.1)")
 
@@ -230,9 +228,8 @@ geom_simplified = df["geom_ccw"].ak.geo.simplify(tolerance=0.0005)
 t1 = time.perf_counter()
 print(f"simplify(0.0005 deg) on {len(df):,} polygons: {(t1-t0)*1000:.0f} ms")
 
-import awkward as ak
-orig_coords = len(ak.ravel(ak.from_arrow(df["geom_ccw"].ak.arrow))) // 2
-simp_coords = len(ak.ravel(ak.from_arrow(geom_simplified.ak.arrow))) // 2
+orig_coords = len(df["geom_ccw"].ak.ravel()) // 2
+simp_coords = len(geom_simplified.ak.ravel()) // 2
 print(f"Coordinate pairs: {orig_coords:,} -> {simp_coords:,}")
 print(f"Reduction:        {(1 - simp_coords/orig_coords)*100:.1f}%")
 

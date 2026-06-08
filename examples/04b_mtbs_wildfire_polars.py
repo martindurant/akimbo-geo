@@ -38,8 +38,8 @@
 #    Series; fields are accessed with ``.struct.field("name")`` instead of
 #    unpacking into a DataFrame.  This is already idiomatic polars.
 #
-# 3. **List column reductions** — polars has native list expressions
-#    (``pl.col(...).list.sum()``) which are cleaner than the pandas equivalents.
+# All ``.ak`` and ``.ak.geo`` operations are otherwise identical between
+# the two backends.
 
 # %% [markdown]
 # ## Setup
@@ -277,16 +277,19 @@ gdf.sort("hist_width_deg", descending=True).select(
 ).head(8)
 
 # %% [markdown]
-# ### Cumulative burned area  (polars list expressions)
+# ### Cumulative burned area  (`ak.transform` + `ak.sum`/`ak.max`)
 #
-# ``event_areas`` is ``List(Float64)``.  Polars native list expressions
-# reduce it without leaving the DataFrame — no ``apply`` or Python loops.
+# ``event_areas`` is ``List(Float64)`` with negative values (CW ring orientation).
+# ``.ak.transform(abs)`` applies element-wise abs across all list elements,
+# returning a new ``List(Float64)`` Series.  ``.ak.sum(axis=1)`` and
+# ``.ak.max(axis=1)`` then reduce each row — identical to the pandas version.
 
 # %%
+abs_event_areas = event_areas.ak.transform(abs)
 gdf = gdf.with_columns(
     event_areas.alias("event_areas"),
-    event_areas.list.eval(pl.element().abs()).list.sum().alias("sum_area_deg2"),
-    event_areas.list.eval(pl.element().abs()).list.max().alias("max_area_deg2"),
+    abs_event_areas.ak.sum(axis=1).alias("sum_area_deg2"),
+    abs_event_areas.ak.max(axis=1).alias("max_area_deg2"),
 )
 print("Total cumulative area — top fires:")
 gdf.sort("sum_area_deg2", descending=True).select(
@@ -314,10 +317,4 @@ print("       polars:  bounds.struct.field('xmin')")
 print("       pandas:  pd.DataFrame(bounds.tolist())['xmin']")
 print("     Both return a float Series; the polars form is more concise.")
 print()
-print("  3. List column reductions:")
-print("       polars:  pl.col('event_areas').list.eval(pl.element().abs()).list.sum()")
-print("       pandas:  event_areas.ak.sum(axis=1)")
-print()
-print("The .ak.geo accessor API is identical in both backends.")
-print("dec() tree-walking, depth-4 nested geometry, from_wkb/from_wkt,")
-print("and all geometry ops work the same way.")
+print("All .ak and .ak.geo operations are otherwise identical between backends.")
