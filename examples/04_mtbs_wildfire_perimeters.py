@@ -92,11 +92,11 @@ df[["fire_name", "fire_type", "year", "acres", "area_deg2"]].nlargest(8, "area_d
 # ### MultiPolygon disjointness  (pure akimbo)
 #
 # A fire event stored as a MultiPolygon has multiple disjoint burned patches.
-# `ak.num` at the outer list level counts the patches per event.
+# ``series.ak.num(axis=1)`` counts the outer-list length per row — the number
+# of polygon patches per event.
 
 # %%
-geom_ak = ak.from_arrow(df["geometry"].ak.arrow)
-df["n_patches"] = ak.num(geom_ak, axis=1).tolist()
+df["n_patches"] = df["geometry"].ak.num(axis=1)
 
 print("Patch count distribution:")
 print(df["n_patches"].value_counts().sort_index().head(8))

@@ -119,9 +119,8 @@ df.group_by("fire_type").agg(
 # ### MultiPolygon patch count  (pure akimbo)
 
 # %%
-n_patches = ak.num(ak.from_arrow(df["geometry"].to_arrow()), axis=1)
 df = df.with_columns(
-    pl.from_arrow(ak.to_arrow(n_patches, extensionarray=False)).alias("n_patches")
+    df["geometry"].ak.num(axis=1).alias("n_patches")
 )
 print("Fire events with the most disjoint burned patches:")
 df.sort("n_patches", descending=True).select(
